@@ -24,7 +24,7 @@
         .page-title{font-size:24px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:8px;}
         .page-title-icon{font-size:22px;}
         .page-subtitle{font-size:14px;color:#6b7280;margin-bottom:12px;}
-        .toolbar{display:flex;gap:10px;margin-bottom:16px;}
+        .toolbar{display:flex;gap:10px;margin-bottom:16px;flex-wrap:wrap;}
         .btn-secondary{display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid #e5e7eb;font-size:13px;color:#374151;text-decoration:none;background:#ffffff;box-shadow:0 4px 10px rgba(15,23,42,0.04);}        
         .btn-secondary:hover{background:#f9fafb;}
         .kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px;}
@@ -87,6 +87,9 @@
         <div class="toolbar">
             <a class="btn-secondary" href="<?= BASE_URL ?>?c=admin&a=emailSettings">
                 ✉️ <?= Lang::get('Email settings') ?>
+            </a>
+            <a class="btn-secondary" href="<?= BASE_URL ?>?c=admin&a=asaasSettings">
+                💳 Asaas settings
             </a>
         </div>
 

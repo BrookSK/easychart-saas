@@ -6,26 +6,40 @@ class AsaasClient
 {
     private static function getConfig(PDO $pdo): array
     {
-        // Busca qualquer configuração Asaas existente (independente do usuário)
-        $stmt = $pdo->prepare("SELECT provider, api_key FROM api_configs WHERE provider IN ('asaas_sandbox','asaas_env')");
+        // Busca configurações Asaas salvas no painel admin
+        $stmt = $pdo->prepare("SELECT provider, api_key FROM api_configs WHERE provider IN ('asaas_sandbox','asaas_production','asaas_env')");
         $stmt->execute();
         $rows = $stmt->fetchAll();
 
         $env = 'sandbox';
         $sandboxKey = '';
+        $productionKey = '';
         foreach ($rows as $row) {
             if ($row['provider'] === 'asaas_env') {
                 $env = $row['api_key'] ?: 'sandbox';
             } elseif ($row['provider'] === 'asaas_sandbox') {
                 $sandboxKey = $row['api_key'];
+            } elseif ($row['provider'] === 'asaas_production') {
+                $productionKey = $row['api_key'];
             }
         }
 
-        $baseUrl = 'https://sandbox.asaas.com/api/v3';
-        $apiKey  = $sandboxKey;
+        $env = $env === 'production' ? 'production' : 'sandbox';
 
-        if (!$apiKey) {
-            throw new RuntimeException('Asaas sandbox API key is not configured.');
+        if ($env === 'production') {
+            $baseUrl = 'https://api.asaas.com/api/v3';
+            $apiKey  = $productionKey;
+
+            if (!$apiKey) {
+                throw new RuntimeException('A API key de produção do Asaas não está configurada.');
+            }
+        } else {
+            $baseUrl = 'https://sandbox.asaas.com/api/v3';
+            $apiKey  = $sandboxKey;
+
+            if (!$apiKey) {
+                throw new RuntimeException('A API key de sandbox do Asaas não está configurada.');
+            }
         }
 
         return [

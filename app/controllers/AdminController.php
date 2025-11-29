@@ -128,6 +128,93 @@ class AdminController
         require __DIR__ . '/../views/admin/email_settings.php';
     }
 
+    public function asaasSettings()
+    {
+        $this->requireSuperAdmin();
+
+        $error = '';
+        $success = false;
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $env = trim($_POST['asaas_env'] ?? 'sandbox');
+            $sandboxKey = trim($_POST['asaas_sandbox_key'] ?? '');
+            $productionKey = trim($_POST['asaas_production_key'] ?? '');
+
+            if ($sandboxKey === '' && $productionKey === '') {
+                $error = 'Informe pelo menos a API key de Sandbox ou de Produção do Asaas.';
+            } else {
+                // Salva ambiente em api_configs (provider = asaas_env)
+                $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE provider = 'asaas_env' LIMIT 1");
+                $stmt->execute();
+                $rowEnv = $stmt->fetch();
+
+                if ($rowEnv) {
+                    $upd = $this->pdo->prepare("UPDATE api_configs SET api_key = :val, updated_at = NOW() WHERE id = :id");
+                    $upd->execute(['val' => $env, 'id' => $rowEnv['id']]);
+                } else {
+                    $ins = $this->pdo->prepare("INSERT INTO api_configs (user_id, provider, api_key) VALUES (NULL, 'asaas_env', :val)");
+                    $ins->execute(['val' => $env]);
+                }
+
+                // Salva key sandbox (provider = asaas_sandbox)
+                $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE provider = 'asaas_sandbox' LIMIT 1");
+                $stmt->execute();
+                $rowKey = $stmt->fetch();
+
+                if ($rowKey) {
+                    $upd = $this->pdo->prepare("UPDATE api_configs SET api_key = :val, updated_at = NOW() WHERE id = :id");
+                    $upd->execute(['val' => $sandboxKey, 'id' => $rowKey['id']]);
+                } else {
+                    $ins = $this->pdo->prepare("INSERT INTO api_configs (user_id, provider, api_key) VALUES (NULL, 'asaas_sandbox', :val)");
+                    $ins->execute(['val' => $sandboxKey]);
+                }
+
+                // Salva key produção (provider = asaas_production)
+                $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE provider = 'asaas_production' LIMIT 1");
+                $stmt->execute();
+                $rowKeyProd = $stmt->fetch();
+
+                if ($rowKeyProd) {
+                    $upd = $this->pdo->prepare("UPDATE api_configs SET api_key = :val, updated_at = NOW() WHERE id = :id");
+                    $upd->execute(['val' => $productionKey, 'id' => $rowKeyProd['id']]);
+                } else {
+                    if ($productionKey !== '') {
+                        $ins = $this->pdo->prepare("INSERT INTO api_configs (user_id, provider, api_key) VALUES (NULL, 'asaas_production', :val)");
+                        $ins->execute(['val' => $productionKey]);
+                    }
+                }
+
+                $success = true;
+            }
+        }
+
+        // Carrega valores atuais
+        $envValue = 'sandbox';
+        $sandboxKeyValue = '';
+        $productionKeyValue = '';
+
+        $stmt = $this->pdo->prepare("SELECT provider, api_key FROM api_configs WHERE provider IN ('asaas_env','asaas_sandbox','asaas_production')");
+        $stmt->execute();
+        $rows = $stmt->fetchAll();
+        foreach ($rows as $row) {
+            if ($row['provider'] === 'asaas_env') {
+                $envValue = $row['api_key'] ?: 'sandbox';
+            } elseif ($row['provider'] === 'asaas_sandbox') {
+                $sandboxKeyValue = $row['api_key'];
+            } elseif ($row['provider'] === 'asaas_production') {
+                $productionKeyValue = $row['api_key'];
+            }
+        }
+
+        $settings = [
+            'asaas_env'         => $envValue,
+            'asaas_sandbox_key' => $sandboxKeyValue,
+            'asaas_production_key' => $productionKeyValue,
+        ];
+
+        require __DIR__ . '/../views/admin/asaas_settings.php';
+    }
+
     public function toggleRole()
     {
         $this->requireSuperAdmin();
