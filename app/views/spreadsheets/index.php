@@ -96,17 +96,14 @@
 
         <section class="upload-card">
             <div class="upload-title"><?= Lang::get('Upload CSV File') ?></div>
-            <div class="upload-subtitle"><?= Lang::get('Upload your spreadsheet to start creating amazing visualizations') ?></div>
             <form method="post" enctype="multipart/form-data">
                 <div class="upload-box">
                     <input type="file" name="spreadsheet" accept=".csv" required>
                     <button class="btn-primary" type="submit"><?= Lang::get('Choose File') ?></button>
                 </div>
-<div class="upload-subtitle">
-    <?= Lang::get('Upload your spreadsheet to start creating amazing visualizations') ?><br>
-    <strong><?= Lang::get('Supported formats: CSV (comma-separated)') ?></strong>
-</div>
-<div class="upload-note"><?= Lang::get('Supports CSV files up to 10MB') ?>.</div>
+                <div class="upload-note">
+                    <?= Lang::get('Supported formats: CSV (comma-separated)') ?> – <?= Lang::get('Supports CSV files up to 10MB') ?>.
+                </div>
             </form>
         </section>
 

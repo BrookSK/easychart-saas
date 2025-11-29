@@ -398,11 +398,9 @@
                         <div>
                             <div class="field-label"><?= Lang::get('Or upload a new spreadsheet') ?></div>
                             <input type="file" name="spreadsheet" class="input">
-                            <div class="upload-subtitle">
-                                <?= Lang::get('Upload your spreadsheet to start creating amazing visualizations') ?><br>
-                                <strong><?= Lang::get('Supported formats: CSV (comma-separated)') ?></strong>
+                            <div class="upload-note">
+                                <?= Lang::get('Supported formats: CSV (comma-separated)') ?> – <?= Lang::get('Supports CSV files up to 10MB') ?>.
                             </div>
-                            <div class="upload-note"><?= Lang::get('Supports CSV files up to 10MB') ?>.</div>
                         </div>
                     </div>
 
