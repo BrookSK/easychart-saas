@@ -63,6 +63,71 @@ class AdminController
         require __DIR__ . '/../views/admin/index.php';
     }
 
+    public function emailSettings()
+    {
+        $this->requireSuperAdmin();
+
+        $error = '';
+        $success = false;
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $smtpHost = trim($_POST['smtp_host'] ?? '');
+            $smtpPort = (int)($_POST['smtp_port'] ?? 0);
+            $smtpUser = trim($_POST['smtp_user'] ?? '');
+            $smtpPassword = trim($_POST['smtp_password'] ?? '');
+            $fromEmail = trim($_POST['from_email'] ?? '');
+            $fromName  = trim($_POST['from_name'] ?? '');
+            $useSmtp   = isset($_POST['use_smtp']) ? 1 : 0;
+
+            if ($fromEmail === '' || $fromName === '') {
+                $error = 'Informe pelo menos o e-mail e o nome do remetente.';
+            } else {
+                $stmt = $this->pdo->query('SELECT id FROM email_settings ORDER BY id ASC LIMIT 1');
+                $settings = $stmt->fetch();
+
+                if ($settings) {
+                    $upd = $this->pdo->prepare('UPDATE email_settings SET smtp_host = :host, smtp_port = :port, smtp_user = :user, smtp_password = :pass, from_email = :from_email, from_name = :from_name, use_smtp = :use_smtp, updated_at = NOW() WHERE id = :id');
+                    $upd->execute([
+                        'host'       => $smtpHost,
+                        'port'       => $smtpPort,
+                        'user'       => $smtpUser,
+                        'pass'       => $smtpPassword,
+                        'from_email' => $fromEmail,
+                        'from_name'  => $fromName,
+                        'use_smtp'   => $useSmtp,
+                        'id'         => $settings['id'],
+                    ]);
+                } else {
+                    $ins = $this->pdo->prepare('INSERT INTO email_settings (smtp_host, smtp_port, smtp_user, smtp_password, from_email, from_name, use_smtp) VALUES (:host, :port, :user, :pass, :from_email, :from_name, :use_smtp)');
+                    $ins->execute([
+                        'host'       => $smtpHost,
+                        'port'       => $smtpPort,
+                        'user'       => $smtpUser,
+                        'pass'       => $smtpPassword,
+                        'from_email' => $fromEmail,
+                        'from_name'  => $fromName,
+                        'use_smtp'   => $useSmtp,
+                    ]);
+                }
+
+                $success = true;
+            }
+        }
+
+        $stmt = $this->pdo->query('SELECT * FROM email_settings ORDER BY id ASC LIMIT 1');
+        $settings = $stmt->fetch() ?: [
+            'smtp_host'     => '',
+            'smtp_port'     => 587,
+            'smtp_user'     => '',
+            'smtp_password' => '',
+            'from_email'    => '',
+            'from_name'     => 'EasyChart',
+            'use_smtp'      => 0,
+        ];
+
+        require __DIR__ . '/../views/admin/email_settings.php';
+    }
+
     public function toggleRole()
     {
         $this->requireSuperAdmin();

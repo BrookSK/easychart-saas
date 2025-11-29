@@ -125,3 +125,29 @@ ON DUPLICATE KEY UPDATE
   monthly_chart_limit       = VALUES(monthly_chart_limit),
   description               = VALUES(description),
   is_active                 = VALUES(is_active);
+
+ALTER TABLE users
+    ADD COLUMN phone VARCHAR(20) NULL AFTER cpf;
+
+CREATE TABLE IF NOT EXISTS email_settings (
+    id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    smtp_host VARCHAR(255) NOT NULL,
+    smtp_port INT UNSIGNED NOT NULL,
+    smtp_user VARCHAR(255) NOT NULL,
+    smtp_password VARCHAR(255) NOT NULL,
+    from_email VARCHAR(255) NOT NULL,
+    from_name VARCHAR(255) NOT NULL,
+    use_smtp TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NULL DEFAULT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE TABLE IF NOT EXISTS password_resets (
+                id INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+                user_id INT UNSIGNED NOT NULL,
+                token VARCHAR(64) NOT NULL UNIQUE,
+                expires_at DATETIME NOT NULL,
+                used_at DATETIME NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;

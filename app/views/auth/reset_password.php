@@ -3,7 +3,7 @@
 <html lang="pt-BR">
 <head>
     <meta charset="UTF-8">
-    <title>EasyChart - Redefinir senha</title>
+    <title>EasyChart - Definir nova senha</title>
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <style>
         body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;background:linear-gradient(135deg,#f5f9ff,#ffffff);color:#111827;}
@@ -28,8 +28,8 @@
 <body>
 <div class="page">
     <div class="card">
-        <h1>Redefinir senha</h1>
-        <p class="subtitle">Informe o e-mail cadastrado para receber o link de redefinição.</p>
+        <h1>Nova senha</h1>
+        <p class="subtitle">Defina uma nova senha para sua conta.</p>
 
         <?php if (!empty($error)): ?>
             <div class="error"><?= htmlspecialchars($error) ?></div>
@@ -37,19 +37,29 @@
 
         <?php if (!empty($success)): ?>
             <div class="success">
-                Se o e-mail informado estiver cadastrado, você receberá um link para redefinir sua senha.
+                Senha redefinida com sucesso. Você já pode fazer login.
             </div>
         <?php endif; ?>
 
-        <form method="post">
-            <label>E-mail</label>
-            <div class="input-wrapper">
-                <span class="input-icon">@</span>
-                <input type="email" name="email" placeholder="Digite seu e-mail" required>
-            </div>
+        <?php if (empty($success)): ?>
+            <form method="post">
+                <input type="hidden" name="token" value="<?= htmlspecialchars($token ?? '') ?>">
 
-            <button class="btn-primary" type="submit">Enviar link de redefinição</button>
-        </form>
+                <label>Nova senha</label>
+                <div class="input-wrapper">
+                    <span class="input-icon">&#128274;</span>
+                    <input type="password" name="new_password" placeholder="Nova senha" required>
+                </div>
+
+                <label>Confirmar nova senha</label>
+                <div class="input-wrapper">
+                    <span class="input-icon">&#128274;</span>
+                    <input type="password" name="confirm_password" placeholder="Confirme a nova senha" required>
+                </div>
+
+                <button class="btn-primary" type="submit">Salvar nova senha</button>
+            </form>
+        <?php endif; ?>
 
         <p class="muted-link">
             <a href="<?= BASE_URL ?>?c=auth&a=login">Voltar para o login</a>
