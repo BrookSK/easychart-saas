@@ -54,6 +54,7 @@ class AsaasClient
         $headers = [
             'access_token: ' . $apiKey,
             'Content-Type: application/json',
+            'User-Agent: EasyChart/1.0 (+https://easychart.onsolutionsbrasil.com.br)'
         ];
 
         $options = [
