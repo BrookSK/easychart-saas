@@ -6,19 +6,19 @@ function db_config(): array
 {
     if (ENVIRONMENT === 'development') {
         return [
-            'host' => '127.0.0.1',
-            'dbname' => 'easychart_dev',
-            'user' => 'root',
-            'pass' => '',
+            'host' => 'localhost',
+            'dbname' => 'easychart-saas',
+            'user' => 'easychart-saas',
+            'pass' => 'Yd8wEtQ*rjv$es41',
             'charset' => 'utf8',
         ];
     }
 
     return [
-        'host' => 'PROD_HOST',
-        'dbname' => 'easychart_prod',
-        'user' => 'PROD_USER',
-        'pass' => 'PROD_PASS',
+        'host' => 'localhost',
+        'dbname' => 'easychart-saas',
+        'user' => 'easychart-saas',
+        'pass' => 'Yd8wEtQ*rjv$es41',
         'charset' => 'utf8',
     ];
 }
