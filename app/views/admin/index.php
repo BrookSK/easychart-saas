@@ -23,7 +23,10 @@
         .content{flex:1;padding:24px 40px 40px;}
         .page-title{font-size:24px;font-weight:600;margin-bottom:4px;display:flex;align-items:center;gap:8px;}
         .page-title-icon{font-size:22px;}
-        .page-subtitle{font-size:14px;color:#6b7280;margin-bottom:24px;}
+        .page-subtitle{font-size:14px;color:#6b7280;margin-bottom:12px;}
+        .toolbar{display:flex;gap:10px;margin-bottom:16px;}
+        .btn-secondary{display:inline-block;padding:8px 12px;border-radius:999px;border:1px solid #e5e7eb;font-size:13px;color:#374151;text-decoration:none;background:#ffffff;box-shadow:0 4px 10px rgba(15,23,42,0.04);}        
+        .btn-secondary:hover{background:#f9fafb;}
         .kpi-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px;}
         .kpi-card{background:#ffffff;border-radius:14px;padding:14px 16px;display:flex;justify-content:space-between;align-items:center;box-shadow:0 12px 24px rgba(15,23,42,0.06);}
         .kpi-label{font-size:12px;text-transform:uppercase;color:#9ca3af;margin-bottom:4px;}
@@ -80,6 +83,12 @@
             <span><?= Lang::get('Admin Panel') ?></span>
         </div>
         <div class="page-subtitle"><?= Lang::get('System overview and user management') ?></div>
+
+        <div class="toolbar">
+            <a class="btn-secondary" href="<?= BASE_URL ?>?c=admin&a=emailSettings">
+                ✉️ <?= Lang::get('Email settings') ?>
+            </a>
+        </div>
 
         <section class="kpi-grid">
             <div class="kpi-card">
