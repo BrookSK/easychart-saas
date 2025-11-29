@@ -9,6 +9,6 @@ if (ENVIRONMENT === 'development') {
     define('BASE_URL', '/Projeto-criacao-graficos/public');
 } else {
     // Em produção, ajuste conforme a pasta pública no servidor
-    // Se o DocumentRoot já for a pasta public, pode usar simplesmente '/'
-    define('BASE_URL', '/public');
+    // Como o domínio deve abrir direto na raiz, use a raiz do site
+    define('BASE_URL', '/');
 }
