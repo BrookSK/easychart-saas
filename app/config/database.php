@@ -8,8 +8,8 @@ function db_config(): array
         return [
             'host' => 'localhost',
             'dbname' => 'easychart-saas',
-            'user' => 'easychart-saas',
-            'pass' => 'Yd8wEtQ*rjv$es41',
+            'user' => 'root',
+            'pass' => '',
             'charset' => 'utf8',
         ];
     }
@@ -17,8 +17,8 @@ function db_config(): array
     return [
         'host' => 'localhost',
         'dbname' => 'easychart-saas',
-        'user' => 'easychart-saas',
-        'pass' => 'Yd8wEtQ*rjv$es41',
+        'user' => 'root',
+        'pass' => '',
         'charset' => 'utf8',
     ];
 }

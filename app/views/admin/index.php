@@ -156,6 +156,7 @@
                             <td><?= (int)$u['sheets_count'] ?></td>
                             <td>
                                 <a href="<?= BASE_URL ?>?c=admin&a=view&id=<?= (int)$u['id'] ?>" style="margin-right:8px;"><?= Lang::get('View') ?></a>
+                                <a href="<?= BASE_URL ?>?c=admin&a=editUserPlan&id=<?= (int)$u['id'] ?>" title="Ajustar plano" style="margin-right:8px;">💼</a>
                                 <?php if ($u['id'] !== $_SESSION['user']['id']): ?>
                                     <a href="<?= BASE_URL ?>?c=admin&a=toggleRole&id=<?= (int)$u['id'] ?>" style="margin-right:8px;">
                                         <?= $u['role'] === 'super_admin' ? Lang::get('Make User') : Lang::get('Make Admin') ?>

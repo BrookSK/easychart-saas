@@ -130,6 +130,7 @@
                 <input class="input" type="password" name="new_password_confirm" placeholder="<?= Lang::get('Confirm New Password') ?>">
             </section>
 
+            <?php if (isset($_SESSION['user']['role']) && $_SESSION['user']['role'] === 'super_admin'): ?>
             <section class="section">
                 <div class="section-title"><?= Lang::get('API Configuration') ?></div>
                 <div class="section-subtitle"><?= Lang::get('Configure your API key used for AI chart generation') ?></div>
@@ -137,6 +138,7 @@
                 <label><?= Lang::get('OpenAI API Key') ?></label>
                 <input class="input" name="api_key" value="<?= htmlspecialchars($apiKeyValue) ?>" placeholder="sk-...">
             </section>
+            <?php endif; ?>
 
             <section class="section">
                 <div class="section-title">Planos</div>

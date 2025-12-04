@@ -290,6 +290,32 @@
             color: #9ca3af;
             font-size: 14px;
         }
+
+        .insights-grid {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .insight-card {
+            flex: 1 1 240px;
+            background: #f9fafb;
+            border-radius: 12px;
+            padding: 10px 12px;
+            font-size: 13px;
+            color: #111827;
+        }
+
+        .insight-title {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+
+        .insight-text {
+            font-size: 13px;
+            color: #4b5563;
+        }
     </style>
 </head>
 
@@ -418,11 +444,36 @@
 
                     <button class="btn-generate" type="submit" <?= !empty($planChartsLocked) ? 'disabled' : '' ?>><?= Lang::get('Generate') ?></button>
 
+                    <?php if (empty($spreadsheets)): ?>
                     <div class="helper-box">
                         <?= Lang::get('Upload your first spreadsheet to start generating charts with AI') ?>.
                     </div>
+                    <?php endif; ?>
                 </form>
             </section>
+            <?php if (!empty($insightsData)): ?>
+            <section class="card-large" style="margin-top:18px;">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title"><?= Lang::get('AI Insights') ?></div>
+                        <div class="card-subtitle"><?= Lang::get('Automatic textual analysis generated from your spreadsheet') ?></div>
+                    </div>
+                </div>
+                <div class="insights-grid">
+                    <?php $insightsToShow = is_array($insightsData) ? array_slice($insightsData, 0, 3) : []; ?>
+                    <?php foreach ($insightsToShow as $insight): ?>
+                        <div class="insight-card">
+                            <?php if (!empty($insight['title'])): ?>
+                                <div class="insight-title"><?= htmlspecialchars($insight['title']) ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($insight['text'])): ?>
+                                <div class="insight-text"><?= nl2br(htmlspecialchars($insight['text'])) ?></div>
+                            <?php endif; ?>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </section>
+            <?php endif; ?>
             <?php if (!empty($chartsData)): ?>
 
                 <!-- Vários gráficos gerados pela IA -->
@@ -443,21 +494,66 @@
                 </div>
                 <script>
                     (function() {
+                        var palette = [
+                            { border: 'rgba(37,99,235,1)', background: 'rgba(37,99,235,0.20)' },
+                            { border: 'rgba(16,185,129,1)', background: 'rgba(16,185,129,0.20)' },
+                            { border: 'rgba(234,179,8,1)', background: 'rgba(234,179,8,0.22)' },
+                            { border: 'rgba(249,115,22,1)', background: 'rgba(249,115,22,0.20)' },
+                            { border: 'rgba(147,51,234,1)', background: 'rgba(147,51,234,0.20)' },
+                            { border: 'rgba(239,68,68,1)', background: 'rgba(239,68,68,0.20)' },
+                            { border: 'rgba(59,130,246,1)', background: 'rgba(59,130,246,0.20)' },
+                            { border: 'rgba(45,212,191,1)', background: 'rgba(45,212,191,0.20)' }
+                        ];
+
+                        function pickColor(index) {
+                            if (!palette.length) {
+                                return { border: '#2563eb', background: 'rgba(37,99,235,0.20)' };
+                            }
+                            var i = index % palette.length;
+                            return palette[i];
+                        }
+
                         var charts = <?= json_encode($chartsData, JSON_UNESCAPED_UNICODE) ?>;
+
                         charts.forEach(function(data, idx) {
                             var canvasId = 'aiChart_' + idx;
+
                             var el = document.getElementById(canvasId);
                             if (!el) return;
                             var ctx = el.getContext('2d');
+
+                            var type = data.type || 'line';
+
+                            // Por padrão, cada item/label recebe sua própria cor da paleta,
+                            // independentemente do tipo de gráfico (bar, line, pie, doughnut, etc.).
+                            var datasetBorderColor = [];
+                            var datasetBackgroundColor = [];
+
+                            if (Array.isArray(data.labels) && data.labels.length > 0) {
+                                data.labels.forEach(function(_, i) {
+                                    var c = pickColor(i);
+                                    datasetBackgroundColor.push(c.background);
+                                    datasetBorderColor.push(c.border);
+                                });
+                            } else {
+                                // Fallback: se não houver labels, usa uma cor única para o dataset.
+                                var fallbackColors = pickColor(idx);
+                                datasetBorderColor = fallbackColors.border;
+                                datasetBackgroundColor = fallbackColors.background;
+                            }
+
                             new Chart(ctx, {
-                                type: data.type || 'line',
+
+                                type: type,
                                 data: {
                                     labels: data.labels,
+
                                     datasets: [{
                                         label: data.title || 'AI Chart',
                                         data: data.values,
-                                        borderColor: '#2563eb',
-                                        backgroundColor: 'rgba(37,99,235,0.12)',
+                                        borderColor: datasetBorderColor,
+                                        backgroundColor: datasetBackgroundColor,
+
                                         tension: 0.25,
                                         fill: true,
                                     }]
@@ -467,12 +563,51 @@
                                     maintainAspectRatio: false,
                                     plugins: {
                                         legend: {
-                                            display: false
+                                            display: true,
+                                            position: 'bottom',
+                                            labels: {
+                                                usePointStyle: true,
+                                                pointStyle: 'rectRounded',
+                                                boxWidth: 14,
+                                                boxHeight: 14,
+                                                padding: 14,
+                                                generateLabels: function(chart) {
+                                                    var data = chart.data || {};
+                                                    var labels = data.labels || [];
+                                                    var ds = (data.datasets && data.datasets[0]) ? data.datasets[0] : null;
+                                                    if (!ds) {
+                                                        return [];
+                                                    }
+
+                                                    var bg = ds.backgroundColor || [];
+                                                    var border = ds.borderColor || [];
+
+                                                    // Normaliza para arrays
+                                                    if (!Array.isArray(bg)) {
+                                                        bg = labels.map(function() { return ds.backgroundColor; });
+                                                    }
+                                                    if (!Array.isArray(border)) {
+                                                        border = labels.map(function() { return ds.borderColor; });
+                                                    }
+
+                                                    return labels.map(function(label, i) {
+                                                        return {
+                                                            text: label,
+                                                            fillStyle: bg[i] || bg[0] || '#2563eb',
+                                                            strokeStyle: border[i] || border[0] || '#2563eb',
+                                                            lineWidth: 1,
+                                                            hidden: false,
+                                                            index: i
+                                                        };
+                                                    });
+                                                }
+                                            }
                                         },
                                         title: {
                                             display: false
                                         }
                                     },
+
                                     scales: {
                                         x: {
                                             ticks: {

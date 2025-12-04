@@ -49,6 +49,7 @@ class Lang
             'Generated Charts' => 'Gráficos Gerados',
             'Saved Dashboards' => 'Dashboards Salvos',
             'AI Insights' => 'Insights IA',
+            'Automatic textual analysis generated from your spreadsheet' => 'Análises textuais automáticas geradas a partir da sua planilha',
             'Recent Charts' => 'Gráficos Recentes',
             'No charts yet' => 'Nenhum gráfico ainda',
             
@@ -189,6 +190,7 @@ class Lang
             'Generated Charts' => 'Generated Charts',
             'Saved Dashboards' => 'Saved Dashboards',
             'AI Insights' => 'AI Insights',
+            'Automatic textual analysis generated from your spreadsheet' => 'Automatic textual analysis generated from your spreadsheet',
             'Recent Charts' => 'Recent Charts',
             'No charts yet' => 'No charts yet',
             
