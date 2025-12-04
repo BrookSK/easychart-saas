@@ -26,6 +26,7 @@ class SettingsController
 
         $user   = $_SESSION['user'];
         $userId = $user['id'];
+        $isSuperAdmin = isset($user['role']) && $user['role'] === 'super_admin';
 
         $error   = '';
         $success = '';
@@ -54,7 +55,8 @@ class SettingsController
             $notifyWeekly  = isset($_POST['notify_weekly']) ? 1 : 0;
             $notifyProduct = isset($_POST['notify_product']) ? 1 : 0;
 
-            $apiKey = trim($_POST['api_key'] ?? '');
+            // Somente super admins podem enviar/alterar API Key
+            $apiKey = $isSuperAdmin ? trim($_POST['api_key'] ?? '') : '';
 
             // Campos de troca de senha
             $currentPassword    = $_POST['current_password'] ?? '';
@@ -130,8 +132,8 @@ class SettingsController
                         'np'  => $notifyProduct,
                     ]);
 
-                    // API config (OpenAI) – continua igual
-                    if ($apiKey !== '') {
+                    // API config (OpenAI) – apenas para super admins
+                    if ($isSuperAdmin && $apiKey !== '') {
                         $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE user_id = :uid AND provider = 'openai' LIMIT 1");
                         $stmt->execute(['uid' => $userId]);
                         $api = $stmt->fetch();
@@ -170,11 +172,14 @@ class SettingsController
             'notification_product_updates' => 1,
         ];
 
-        $stmt = $this->pdo->prepare("SELECT api_key FROM api_configs WHERE user_id = :uid AND provider = 'openai' LIMIT 1");
-        $stmt->execute(['uid' => $userId]);
-        $apiConfig = $stmt->fetch();
-
-        $apiKeyValue = $apiConfig ? $apiConfig['api_key'] : '';
+        // Apenas super admins carregam/visualizam API Key própria
+        $apiKeyValue = '';
+        if ($isSuperAdmin) {
+            $stmt = $this->pdo->prepare("SELECT api_key FROM api_configs WHERE user_id = :uid AND provider = 'openai' LIMIT 1");
+            $stmt->execute(['uid' => $userId]);
+            $apiConfig = $stmt->fetch();
+            $apiKeyValue = $apiConfig ? $apiConfig['api_key'] : '';
+        }
 
         require __DIR__ . '/../views/settings/index.php';
     }

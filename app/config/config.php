@@ -10,5 +10,5 @@ if (ENVIRONMENT === 'development') {
 } else {
     // Em produção, ajuste conforme a pasta pública no servidor
     // Como o domínio deve abrir direto na raiz, use a raiz do site
-    define('BASE_URL', '/');
+    define('BASE_URL', '/easychart-saas/');
 }

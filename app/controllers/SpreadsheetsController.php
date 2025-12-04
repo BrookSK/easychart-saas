@@ -50,29 +50,39 @@ class SpreadsheetsController
                 if ($ext !== 'csv') {
                     $error = 'Only CSV files are supported.';
                 } else {
-                    $storedName = uniqid('sheet_', true) . '.' . $ext;
-
-                    $storageDir = __DIR__ . '/../../storage/spreadsheets';
-                    if (!is_dir($storageDir)) {
-                        mkdir($storageDir, 0777, true);
-                    }
-
-                    $destPath = $storageDir . '/' . $storedName;
-                    if (move_uploaded_file($tmpName, $destPath)) {
-                        $stmt = $this->pdo->prepare('INSERT INTO spreadsheets (user_id, original_name, stored_name, mime_type, size_bytes) VALUES (:user_id, :original_name, :stored_name, :mime_type, :size_bytes)');
-                        $stmt->execute([
-                            'user_id'       => $userId,
-                            'original_name' => $originalName,
-                            'stored_name'   => $storedName,
-                            'mime_type'     => $mimeType,
-                            'size_bytes'    => $sizeBytes,
-                        ]);
-                        $success = 'Spreadsheet uploaded successfully.';
-                        // Após upload bem‑sucedido, recalcula status do plano para a view
-                        [$canUploadInitial, $planUploadMessage] = PlanHelper::canUploadSpreadsheet($this->pdo, $userId);
-                        $planUploadLocked = !$canUploadInitial;
+                    // Não permite duas planilhas com o mesmo nome para o mesmo usuário
+                    $dup = $this->pdo->prepare('SELECT id FROM spreadsheets WHERE user_id = :user_id AND original_name = :original_name LIMIT 1');
+                    $dup->execute([
+                        'user_id'       => $userId,
+                        'original_name' => $originalName,
+                    ]);
+                    if ($dup->fetch()) {
+                        $error = 'You already uploaded a spreadsheet with this name. Please rename the file before uploading again.';
                     } else {
-                        $error = 'Failed to save uploaded file.';
+                        $storedName = uniqid('sheet_', true) . '.' . $ext;
+
+                        $storageDir = __DIR__ . '/../../storage/spreadsheets';
+                        if (!is_dir($storageDir)) {
+                            mkdir($storageDir, 0777, true);
+                        }
+
+                        $destPath = $storageDir . '/' . $storedName;
+                        if (move_uploaded_file($tmpName, $destPath)) {
+                            $stmt = $this->pdo->prepare('INSERT INTO spreadsheets (user_id, original_name, stored_name, mime_type, size_bytes) VALUES (:user_id, :original_name, :stored_name, :mime_type, :size_bytes)');
+                            $stmt->execute([
+                                'user_id'       => $userId,
+                                'original_name' => $originalName,
+                                'stored_name'   => $storedName,
+                                'mime_type'     => $mimeType,
+                                'size_bytes'    => $sizeBytes,
+                            ]);
+                            $success = 'Spreadsheet uploaded successfully.';
+                            // Após upload bem‑sucedido, recalcula status do plano para a view
+                            [$canUploadInitial, $planUploadMessage] = PlanHelper::canUploadSpreadsheet($this->pdo, $userId);
+                            $planUploadLocked = !$canUploadInitial;
+                        } else {
+                            $error = 'Failed to save uploaded file.';
+                        }
                     }
                 }
             } else {

@@ -367,6 +367,78 @@ class AdminController
         exit;
     }
 
+    public function editUserPlan()
+    {
+        $this->requireSuperAdmin();
+
+        $id = (int)($_GET['id'] ?? ($_POST['id'] ?? 0));
+        if ($id <= 0) {
+            header('Location: ' . BASE_URL . '?c=admin&a=index');
+            exit;
+        }
+
+        $error = '';
+        $success = false;
+
+        $stmt = $this->pdo->prepare('SELECT id, full_name, email, plan_id, plan_status, plan_activated_at, plan_expires_at, asaas_subscription_id FROM users WHERE id = :id LIMIT 1');
+        $stmt->execute(['id' => $id]);
+        $userPlan = $stmt->fetch();
+
+        if (!$userPlan) {
+            header('Location: ' . BASE_URL . '?c=admin&a=index');
+            exit;
+        }
+
+        $plansStmt = $this->pdo->query('SELECT id, name, slug FROM plans WHERE is_active = 1 ORDER BY price_cents ASC');
+        $plans = $plansStmt->fetchAll();
+
+        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+            $removePlan = isset($_POST['remove_plan']);
+
+            if ($removePlan) {
+                $upd = $this->pdo->prepare('UPDATE users SET plan_id = NULL, plan_status = :status, plan_activated_at = NULL, plan_expires_at = NULL, asaas_subscription_id = NULL WHERE id = :id');
+                $upd->execute([
+                    'status' => 'free',
+                    'id'     => $id,
+                ]);
+                $success = true;
+            } else {
+                $planIdRaw = $_POST['plan_id'] ?? '';
+                $planId = $planIdRaw !== '' ? (int)$planIdRaw : null;
+                $status = $_POST['plan_status'] ?? 'free';
+
+                $allowedStatuses = ['free', 'pending', 'active', 'past_due', 'canceled'];
+                if (!in_array($status, $allowedStatuses, true)) {
+                    $status = 'free';
+                }
+
+                $expiresRaw = trim($_POST['plan_expires_at'] ?? '');
+                $expires = $expiresRaw !== '' ? $expiresRaw : null;
+
+                if ($planId === null && $status !== 'free') {
+                    $error = 'Selecione um plano ou marque para remover o plano.';
+                } else {
+                    $upd = $this->pdo->prepare('UPDATE users SET plan_id = :plan_id, plan_status = :status, plan_expires_at = :expires WHERE id = :id');
+                    $upd->execute([
+                        'plan_id' => $planId,
+                        'status'  => $status,
+                        'expires' => $expires,
+                        'id'      => $id,
+                    ]);
+                    $success = true;
+                }
+            }
+
+            if ($success && !$error) {
+                $stmt = $this->pdo->prepare('SELECT id, full_name, email, plan_id, plan_status, plan_activated_at, plan_expires_at, asaas_subscription_id FROM users WHERE id = :id LIMIT 1');
+                $stmt->execute(['id' => $id]);
+                $userPlan = $stmt->fetch();
+            }
+        }
+
+        require __DIR__ . '/../views/admin/user_plan.php';
+    }
+
     public function view()
     {
         $this->requireSuperAdmin();
