@@ -102,17 +102,28 @@ class DashboardController
                             }
 
                             $ins = $pdo->prepare('INSERT INTO analysis_reports (user_id, spreadsheet_id, user_request, dataset_profile_json, inferred_context_json, analytics_json, charts_json, report_text) VALUES (:uid, :sid, :req, :dp, :ic, :an, :cj, :rt)');
-                            $ins->execute([
-                                'uid' => (int)$user['id'],
-                                'sid' => (int)$spreadsheetId,
-                                'req' => $prompt,
-                                'dp'  => json_encode($datasetProfileToStore, JSON_UNESCAPED_UNICODE),
-                                'ic'  => json_encode($result['inferred_context'] ?? null, JSON_UNESCAPED_UNICODE),
-                                'an'  => json_encode($result['analytics'] ?? null, JSON_UNESCAPED_UNICODE),
-                                'cj'  => json_encode($chartsList, JSON_UNESCAPED_UNICODE),
-                                'rt'  => $analysisReportText,
-                            ]);
-                            $analysisReportId = (int)$pdo->lastInsertId();
+                            try {
+                                $ins->execute([
+                                    'uid' => (int)$user['id'],
+                                    'sid' => (int)$spreadsheetId,
+                                    'req' => $prompt,
+                                    'dp'  => json_encode($datasetProfileToStore, JSON_UNESCAPED_UNICODE),
+                                    'ic'  => json_encode($result['inferred_context'] ?? null, JSON_UNESCAPED_UNICODE),
+                                    'an'  => json_encode($result['analytics'] ?? null, JSON_UNESCAPED_UNICODE),
+                                    'cj'  => json_encode($chartsList, JSON_UNESCAPED_UNICODE),
+                                    'rt'  => $analysisReportText,
+                                ]);
+                                $analysisReportId = (int)$pdo->lastInsertId();
+                            } catch (PDOException $e) {
+                                $msg = $e->getMessage();
+                                $isMissingTable = (strpos($msg, 'SQLSTATE[42S02]') !== false) || (strpos($msg, "doesn't exist") !== false);
+                                $mentionsTable = (strpos($msg, 'analysis_reports') !== false);
+                                if ($isMissingTable && $mentionsTable) {
+                                    $error = 'Missing database table `analysis_reports`. Please run migration: database/20260207_000002_create_analysis_reports.sql';
+                                } else {
+                                    throw $e;
+                                }
+                            }
                         }
                     }
 
