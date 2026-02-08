@@ -399,6 +399,20 @@
             <script>
                 (function(){
                     var charts = <?= json_encode($chartsData, JSON_UNESCAPED_UNICODE) ?>;
+                    function truncateLabel(s, max){
+                        s = (s === null || s === undefined) ? '' : String(s);
+                        if (!max) max = 28;
+                        return s.length > max ? (s.slice(0, max - 1) + '…') : s;
+                    }
+                    function palette(n){
+                        var out = [];
+                        var count = Math.max(1, n || 1);
+                        for (var i = 0; i < count; i++){
+                            var hue = Math.round((i * 360) / count);
+                            out.push('hsl(' + hue + ', 70%, 50%)');
+                        }
+                        return out;
+                    }
                     charts.forEach(function(data, idx){
                         var canvasId = 'aiChart_' + idx;
                         var el = document.getElementById(canvasId);
@@ -406,31 +420,50 @@
                         var ctx = el.getContext('2d');
                         var type = data.type || 'line';
                         if (type === 'boxplot' || type === 'gantt') type = 'bar';
+
+                        var rawLabels = Array.isArray(data.labels) ? data.labels : [];
+                        var labels = rawLabels.map(function(l){ return truncateLabel(l, type === 'pie' ? 40 : 28); });
+
+                        var values = Array.isArray(data.values) ? data.values : [];
+                        var colors = palette(labels.length);
+                        var isPie = type === 'pie';
+                        var isLine = type === 'line';
+                        var isRadar = type === 'radar';
+                        var isBar = type === 'bar';
+                        var datasetBg = isPie ? colors : (isBar ? colors.map(function(c){ return c.replace('50%)', '60%)'); }) : 'rgba(37,99,235,0.12)';
+                        var datasetBorder = isPie || isBar ? colors : '#2563eb';
+
                         new Chart(ctx, {
                             type: type,
                             data: {
-                                labels: data.labels,
+                                labels: labels,
                                 datasets: [{
                                     label: data.title || 'AI Chart',
-                                    data: data.values,
-                                    borderColor: '#2563eb',
-                                    backgroundColor: type === 'pie' ? [
-                                        '#2563eb','#22c55e','#f97316','#a855f7','#14b8a6','#ef4444','#0ea5e9','#84cc16','#eab308','#64748b'
-                                    ] : 'rgba(37,99,235,0.12)',
+                                    data: values,
+                                    borderColor: datasetBorder,
+                                    backgroundColor: datasetBg,
                                     tension: 0.25,
-                                    fill: type === 'line',
+                                    fill: isLine,
                                 }]
                             },
                             options: {
                                 responsive: true,
                                 maintainAspectRatio: false,
                                 plugins: {
-                                    legend: {display: type === 'pie' || type === 'radar'},
+                                    legend: {display: isPie || isRadar, position: 'bottom'},
                                     title: {display: false}
                                 },
                                 scales: {
-                                    x: (type === 'pie' || type === 'radar') ? {} : {ticks: {autoSkip: true, maxTicksLimit: 12}},
-                                    y: (type === 'pie' || type === 'radar') ? {} : {beginAtZero: false}
+                                    x: (isPie || isRadar) ? {} : {
+                                        ticks: {
+                                            autoSkip: true,
+                                            maxTicksLimit: 10,
+                                            callback: function(v, i){
+                                                return truncateLabel(labels[i], 18);
+                                            }
+                                        }
+                                    },
+                                    y: (isPie || isRadar) ? {} : {beginAtZero: false, ticks: {maxTicksLimit: 6}}
                                 }
                             }
                         });

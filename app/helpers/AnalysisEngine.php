@@ -21,8 +21,8 @@ class AnalysisEngine
         $context = self::inferContext($cleanHeaders, $typed, $profile, $requestPlan, $columnMap);
 
         // ETAPA 2: O que é relevante (insights/indicadores) para o pedido
-        $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan);
-        $dashboardPlan = self::buildDashboardPlan($profile, $context, $analytics, $requestPlan);
+        $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan, $columnMap);
+        $dashboardPlan = self::buildDashboardPlan($profile, $context, $analytics, $requestPlan, $columnMap);
 
         // ETAPA 3: Criação dos gráficos específicos (apenas o que faz sentido para a solicitação)
         $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
@@ -497,6 +497,109 @@ class AnalysisEngine
             $candidates[] = ['idx' => $i, 'name' => $name, 'lower' => $lower, 'type' => $t];
         }
 
+        $sampleRows = $profile['sample_rows'] ?? [];
+        if (!is_array($sampleRows)) {
+            $sampleRows = [];
+        }
+
+        $colSample = function(int $idx) use ($sampleRows): array {
+            $out = [];
+            foreach ($sampleRows as $row) {
+                $out[] = isset($row[$idx]) ? (string)$row[$idx] : '';
+            }
+            return $out;
+        };
+
+        $numericProfile = function(array $vals): array {
+            $n = 0;
+            $neg = 0;
+            $zero = 0;
+            $sumAbs = 0.0;
+            $sum = 0.0;
+            $currencyLike = 0;
+            foreach ($vals as $s) {
+                $st = trim((string)$s);
+                if ($st === '') {
+                    continue;
+                }
+                if (preg_match('/(R\$|\$|€|£)/u', $st)) {
+                    $currencyLike++;
+                }
+                $v = self::parseNumber($st);
+                if ($v === null) {
+                    continue;
+                }
+                $n++;
+                $sum += (float)$v;
+                $sumAbs += abs((float)$v);
+                if ($v < 0) {
+                    $neg++;
+                }
+                if ($v == 0.0) {
+                    $zero++;
+                }
+            }
+            return [
+                'n' => $n,
+                'neg_ratio' => $n > 0 ? ($neg / $n) : 0.0,
+                'zero_ratio' => $n > 0 ? ($zero / $n) : 0.0,
+                'mean_abs' => $n > 0 ? ($sumAbs / $n) : 0.0,
+                'mean' => $n > 0 ? ($sum / $n) : 0.0,
+                'currency_ratio' => count($vals) > 0 ? ($currencyLike / max(1, count($vals))) : 0.0,
+            ];
+        };
+
+        $textProfile = function(array $vals): array {
+            $nonEmpty = 0;
+            $sumLen = 0;
+            $distinct = [];
+            $keywords = [
+                'receita' => 0,
+                'despesa' => 0,
+                'custo' => 0,
+                'beneficio' => 0,
+                'ganho' => 0,
+                'perda' => 0,
+            ];
+            foreach ($vals as $s) {
+                $st = trim((string)$s);
+                if ($st === '') {
+                    continue;
+                }
+                $nonEmpty++;
+                $sumLen += mb_strlen($st);
+                $distinct[mb_strtolower($st)] = true;
+                $low = mb_strtolower($st);
+                if (strpos($low, 'receita') !== false || strpos($low, 'credito') !== false || strpos($low, 'crédito') !== false) {
+                    $keywords['receita']++;
+                }
+                if (strpos($low, 'despesa') !== false || strpos($low, 'debito') !== false || strpos($low, 'débito') !== false) {
+                    $keywords['despesa']++;
+                }
+                if (strpos($low, 'custo') !== false) {
+                    $keywords['custo']++;
+                }
+                if (strpos($low, 'benef') !== false) {
+                    $keywords['beneficio']++;
+                }
+                if (strpos($low, 'ganh') !== false) {
+                    $keywords['ganho']++;
+                }
+                if (strpos($low, 'perd') !== false) {
+                    $keywords['perda']++;
+                }
+            }
+            $avgLen = $nonEmpty > 0 ? ($sumLen / $nonEmpty) : 0.0;
+            $distinctCount = count($distinct);
+            $ratio = $nonEmpty > 0 ? ($distinctCount / $nonEmpty) : 0.0;
+            return [
+                'non_empty' => $nonEmpty,
+                'avg_len' => $avgLen,
+                'distinct_ratio' => $ratio,
+                'keywords' => $keywords,
+            ];
+        };
+
         $pick = function(string $role, callable $scoreFn) use ($candidates): array {
             $best = null;
             $bestScore = -1.0;
@@ -515,12 +618,14 @@ class AnalysisEngine
             return ['column' => $best['name'], 'confidence' => $conf];
         };
 
-        $amount = $pick('amount', function($c) {
+        $amount = $pick('amount', function($c) use ($colSample, $numericProfile) {
             if (($c['type'] ?? '') !== 'numerica') {
                 return 0.0;
             }
             $h = $c['lower'] ?? '';
-            $score = 0.20;
+            $vals = $colSample((int)$c['idx']);
+            $np = $numericProfile($vals);
+            $score = 0.15;
             if (preg_match('/\b(valor|amount|total|pre[cç]o|price|receita|revenue|gasto|despesa|custo|pagamento|pago|a\s*pagar|a\s*receber|saldo)\b/u', $h)) {
                 $score += 0.70;
             }
@@ -529,6 +634,52 @@ class AnalysisEngine
             }
             if (preg_match('/\b(id|cpf|cnpj|codigo|c[oó]digo)\b/u', $h)) {
                 $score -= 0.40;
+            }
+            if (($np['n'] ?? 0) >= 10) {
+                // valores monetários tendem a ter média absoluta relevante e/ou símbolo de moeda
+                if (($np['mean_abs'] ?? 0.0) > 1.0) {
+                    $score += 0.25;
+                }
+                if (($np['currency_ratio'] ?? 0.0) >= 0.10) {
+                    $score += 0.25;
+                }
+            }
+            return max(0.0, $score);
+        });
+
+        $cost = $pick('cost', function($c) use ($colSample, $numericProfile) {
+            if (($c['type'] ?? '') !== 'numerica') {
+                return 0.0;
+            }
+            $h = $c['lower'] ?? '';
+            $vals = $colSample((int)$c['idx']);
+            $np = $numericProfile($vals);
+            $score = 0.05;
+            if (preg_match('/\b(custo|cost|despesa|expense|gasto|spend)\b/u', $h)) {
+                $score += 0.75;
+            }
+            if (($np['neg_ratio'] ?? 0.0) > 0.05) {
+                $score += 0.10;
+            }
+            if (($np['mean_abs'] ?? 0.0) > 1.0) {
+                $score += 0.10;
+            }
+            return max(0.0, $score);
+        });
+
+        $benefit = $pick('benefit', function($c) use ($colSample, $numericProfile) {
+            if (($c['type'] ?? '') !== 'numerica') {
+                return 0.0;
+            }
+            $h = $c['lower'] ?? '';
+            $vals = $colSample((int)$c['idx']);
+            $np = $numericProfile($vals);
+            $score = 0.05;
+            if (preg_match('/\b(benef[ií]cio|benefit|ganho|gain|lucro|profit|receita|revenue)\b/u', $h)) {
+                $score += 0.75;
+            }
+            if (($np['mean_abs'] ?? 0.0) > 1.0) {
+                $score += 0.10;
             }
             return max(0.0, $score);
         });
@@ -545,11 +696,13 @@ class AnalysisEngine
             return max(0.0, $score);
         });
 
-        $category = $pick('category', function($c) {
+        $category = $pick('category', function($c) use ($colSample, $textProfile) {
             if (($c['type'] ?? '') !== 'categorica') {
                 return 0.0;
             }
             $h = $c['lower'] ?? '';
+            $vals = $colSample((int)$c['idx']);
+            $tp = $textProfile($vals);
             $score = 0.15;
             if (preg_match('/\b(categoria|category|grupo|group|tipo|type|centro\s*de\s*custo|cc|natureza|conta|account)\b/u', $h)) {
                 $score += 0.75;
@@ -560,14 +713,25 @@ class AnalysisEngine
             if (preg_match('/\b(id|cpf|cnpj|codigo|c[oó]digo)\b/u', $h)) {
                 $score -= 0.35;
             }
+            // categoria tende a ter texto mais curto e repetição (distinct_ratio menor)
+            if (($tp['non_empty'] ?? 0) >= 10) {
+                if (($tp['avg_len'] ?? 0.0) > 0 && ($tp['avg_len'] ?? 0.0) <= 28) {
+                    $score += 0.15;
+                }
+                if (($tp['distinct_ratio'] ?? 1.0) > 0.0 && ($tp['distinct_ratio'] ?? 1.0) <= 0.60) {
+                    $score += 0.15;
+                }
+            }
             return max(0.0, $score);
         });
 
-        $subCategory = $pick('sub_category', function($c) {
+        $subCategory = $pick('sub_category', function($c) use ($colSample, $textProfile) {
             if (($c['type'] ?? '') !== 'categorica') {
                 return 0.0;
             }
             $h = $c['lower'] ?? '';
+            $vals = $colSample((int)$c['idx']);
+            $tp = $textProfile($vals);
             $score = 0.10;
             if (preg_match('/\b(subcategoria|sub\s*categoria|item|lan[cç]amento|descri[cç][aã]o|descricao|hist[oó]rico|fornecedor|vendor|benefici[aá]rio|cliente|product|produto|servi[cç]o)\b/u', $h)) {
                 $score += 0.85;
@@ -577,6 +741,37 @@ class AnalysisEngine
             }
             if (preg_match('/\b(id|cpf|cnpj|codigo|c[oó]digo)\b/u', $h)) {
                 $score -= 0.35;
+            }
+            // descrição/subcategoria tende a ser mais longa e mais diversa
+            if (($tp['non_empty'] ?? 0) >= 10) {
+                if (($tp['avg_len'] ?? 0.0) >= 18) {
+                    $score += 0.15;
+                }
+                if (($tp['distinct_ratio'] ?? 0.0) >= 0.55) {
+                    $score += 0.15;
+                }
+            }
+            return max(0.0, $score);
+        });
+
+        $direction = $pick('direction', function($c) use ($colSample, $textProfile) {
+            if (($c['type'] ?? '') !== 'categorica') {
+                return 0.0;
+            }
+            $h = $c['lower'] ?? '';
+            $vals = $colSample((int)$c['idx']);
+            $tp = $textProfile($vals);
+            $score = 0.05;
+            if (preg_match('/\b(tipo|type|natureza|movimento|opera[cç][aã]o|entrada|sa[ií]da|credito|cr[eé]dito|debito|d[eé]bito|ganho|perda)\b/u', $h)) {
+                $score += 0.75;
+            }
+            $kw = $tp['keywords'] ?? [];
+            $hits = (int)($kw['receita'] ?? 0) + (int)($kw['despesa'] ?? 0) + (int)($kw['ganho'] ?? 0) + (int)($kw['perda'] ?? 0);
+            if (($tp['non_empty'] ?? 0) > 0) {
+                $ratio = $hits / max(1, (int)$tp['non_empty']);
+                if ($ratio >= 0.10) {
+                    $score += 0.25;
+                }
             }
             return max(0.0, $score);
         });
@@ -588,9 +783,12 @@ class AnalysisEngine
 
         return [
             'amount' => $amount,
+            'cost' => $cost,
+            'benefit' => $benefit,
             'date' => $date,
             'category' => $category,
             'sub_category' => $subCategory,
+            'direction' => $direction,
         ];
     }
 
@@ -638,7 +836,7 @@ class AnalysisEngine
         return $best;
     }
 
-    private static function buildDashboardPlan(array $profile, array $context, array $analytics, array $requestPlan): array
+    private static function buildDashboardPlan(array $profile, array $context, array $analytics, array $requestPlan, array $columnMap): array
     {
         $intents = $requestPlan['intents'] ?? ['auto'];
         if (!is_array($intents) || empty($intents)) {
@@ -696,17 +894,19 @@ class AnalysisEngine
                 'entity' => $entity,
                 'time_axis' => $timeAxis,
             ],
+            'column_map' => $columnMap,
             'kpis' => $kpis,
             'recommended_outputs' => $recommended,
         ];
     }
 
-    private static function buildAnalytics(array $headers, array $rows, array $types, array $context, array $requestPlan): array
+    private static function buildAnalytics(array $headers, array $rows, array $types, array $context, array $requestPlan, array $columnMap): array
     {
         $numericStats = [];
         $categoricalStats = [];
         $temporalStats = [];
         $comparisons = [];
+        $finance = [];
 
         foreach ($types as $i => $t) {
             $name = $headers[$i] ?? ('col_' . ($i + 1));
@@ -760,6 +960,42 @@ class AnalysisEngine
         $metric = $context['main_metric'] ?? null;
         $entity = $context['main_entity'] ?? null;
         $aggPref = $requestPlan['agg'] ?? null;
+
+        // Ganhos x Perdas: tenta usar coluna amount (mapeada) e sinais (+/-)
+        $amountCol = $columnMap['amount']['column'] ?? null;
+        if (is_string($amountCol) && $amountCol !== '') {
+            $aIdx = array_search($amountCol, $headers, true);
+            if ($aIdx !== false) {
+                $sumPos = 0.0;
+                $sumNeg = 0.0;
+                $countPos = 0;
+                $countNeg = 0;
+                foreach ($rows as $row) {
+                    $v = isset($row[$aIdx]) ? self::parseNumber((string)$row[$aIdx]) : null;
+                    if ($v === null) {
+                        continue;
+                    }
+                    if ($v >= 0) {
+                        $sumPos += (float)$v;
+                        $countPos++;
+                    } else {
+                        $sumNeg += (float)$v;
+                        $countNeg++;
+                    }
+                }
+
+                if (($countPos + $countNeg) > 0) {
+                    $finance['cashflow'] = [
+                        'amount_column' => $amountCol,
+                        'sum_positive' => $sumPos,
+                        'sum_negative' => $sumNeg,
+                        'net' => $sumPos + $sumNeg,
+                        'count_positive' => $countPos,
+                        'count_negative' => $countNeg,
+                    ];
+                }
+            }
+        }
 
         // Comparação entidade x métrica (soma) + participação percentual
         if ($entity && $metric) {
@@ -834,12 +1070,17 @@ class AnalysisEngine
             'categorical' => $categoricalStats,
             'temporal' => $temporalStats,
             'comparisons' => $comparisons,
+            'finance' => $finance,
         ];
     }
 
     private static function buildCharts(array $headers, array $rows, array $types, array $context, array $analytics, array $requestPlan, array $dashboardPlan = [], array $columnMap = []): array
     {
         $charts = [];
+
+        $push = function(array $chart) use (&$charts): void {
+            $charts[] = $chart;
+        };
 
         $intents = $requestPlan['intents'] ?? ['auto'];
         if (!is_array($intents) || empty($intents)) {
@@ -850,6 +1091,65 @@ class AnalysisEngine
         $wantComparison = in_array('comparison', $intents, true) || in_array('auto', $intents, true);
         $wantDistribution = in_array('distribution', $intents, true) || in_array('auto', $intents, true);
         $wantShare = in_array('share', $intents, true) || in_array('auto', $intents, true);
+
+        // Finance overview (ganhos x perdas / saldo) - aparece cedo para deixar o dashboard claro
+        if (!empty($analytics['finance']['cashflow'])) {
+            $cf = $analytics['finance']['cashflow'];
+            $pos = (float)($cf['sum_positive'] ?? 0);
+            $neg = (float)($cf['sum_negative'] ?? 0);
+            $net = (float)($cf['net'] ?? 0);
+
+            // Pizza / participação (ganhos x perdas)
+            $push([
+                'chart_type' => 'pie',
+                'title' => 'Ganhos x Perdas (participação)',
+                'description' => 'Participação percentual de valores positivos (ganhos) vs negativos (perdas).',
+                'labels' => ['Ganhos', 'Perdas'],
+                'values' => [abs($pos), abs($neg)],
+            ]);
+
+            // Barra / saldo líquido
+            $push([
+                'chart_type' => 'bar',
+                'title' => 'Resumo financeiro (total)',
+                'description' => 'Totais agregados: ganhos, perdas e saldo líquido.',
+                'labels' => ['Ganhos', 'Perdas', 'Saldo'],
+                'values' => [$pos, $neg, $net],
+            ]);
+        }
+
+        // Custo x Benefício (quando existem colunas próprias)
+        $costCol = $columnMap['cost']['column'] ?? null;
+        $benefCol = $columnMap['benefit']['column'] ?? null;
+        if (is_string($costCol) && $costCol !== '' && is_string($benefCol) && $benefCol !== '' && $costCol !== $benefCol) {
+            $cIdx = array_search($costCol, $headers, true);
+            $bIdx = array_search($benefCol, $headers, true);
+            if ($cIdx !== false && $bIdx !== false) {
+                $sumC = 0.0;
+                $sumB = 0.0;
+                $n = 0;
+                foreach ($rows as $row) {
+                    $cv = isset($row[$cIdx]) ? self::parseNumber((string)$row[$cIdx]) : null;
+                    $bv = isset($row[$bIdx]) ? self::parseNumber((string)$row[$bIdx]) : null;
+                    if ($cv === null || $bv === null) {
+                        continue;
+                    }
+                    $sumC += (float)$cv;
+                    $sumB += (float)$bv;
+                    $n++;
+                }
+                if ($n > 0) {
+                    $roi = $sumC != 0.0 ? ($sumB / $sumC) : null;
+                    $push([
+                        'chart_type' => 'bar',
+                        'title' => 'Custo x Benefício (total)',
+                        'description' => 'Comparação agregada entre custo e benefício. ROI=' . ($roi === null ? 'n/a' : self::fmt((float)$roi)),
+                        'labels' => ['Custo', 'Benefício'],
+                        'values' => [$sumC, $sumB],
+                    ]);
+                }
+            }
+        }
 
         foreach (($analytics['numeric'] ?? []) as $col => $stats) {
             if (!$wantDistribution) {
@@ -949,13 +1249,13 @@ class AnalysisEngine
             }
             $topAgg = array_slice($topAgg, 0, min(50, $limit), true);
 
-            $charts[] = [
+            $push([
                 'chart_type' => 'bar',
                 'title' => 'Top ' . ($cmp['entity'] ?? 'entidades') . ' por soma de ' . ($cmp['metric'] ?? 'métrica'),
                 'description' => 'Ranking por soma da métrica (top 20).',
                 'labels' => array_keys($topAgg),
                 'values' => array_values($topAgg),
-            ];
+            ]);
 
             // Drilldown: detalhar dentro de cada categoria (quando pedido)
             $wantsDetail = (bool)($requestPlan['wants_detail'] ?? false);
@@ -999,13 +1299,13 @@ class AnalysisEngine
                         }
                         arsort($subAgg);
                         $subTop = array_slice($subAgg, 0, 12, true);
-                        $charts[] = [
+                        $push([
                             'chart_type' => 'bar',
                             'title' => 'Detalhamento: ' . $cat . ' (' . $secondary . ')',
                             'description' => 'Top itens/subcategorias dentro da categoria selecionada, por soma da métrica.',
                             'labels' => array_keys($subTop),
                             'values' => array_values($subTop),
-                        ];
+                        ]);
                     }
                 }
             }
@@ -1021,13 +1321,13 @@ class AnalysisEngine
                     foreach ($shares as $k => $s) {
                         $pct[] = round((float)$s * 100, 2);
                     }
-                    $charts[] = [
+                    $push([
                         'chart_type' => 'pie',
                         'title' => 'Participação (soma): ' . ($cmp['entity'] ?? 'entidade'),
                         'description' => 'Participação percentual por soma da métrica (top).',
                         'labels' => array_keys($shares),
                         'values' => $pct,
-                    ];
+                    ]);
                 }
             }
         }
@@ -1035,24 +1335,24 @@ class AnalysisEngine
         if ($wantTime && !empty($analytics['temporal']['series'])) {
             $labels = array_keys($analytics['temporal']['series']);
             $values = array_values($analytics['temporal']['series']);
-            $charts[] = [
+            $push([
                 'chart_type' => 'line',
                 'title' => 'Evolução temporal: ' . ($context['main_metric'] ?? 'métrica'),
                 'description' => 'Série temporal agregada por dia.',
                 'labels' => $labels,
                 'values' => $values,
-            ];
+            ]);
 
             if (!empty($analytics['temporal']['series_monthly'])) {
                 $mLabels = array_keys($analytics['temporal']['series_monthly']);
                 $mValues = array_values($analytics['temporal']['series_monthly']);
-                $charts[] = [
+                $push([
                     'chart_type' => 'line',
                     'title' => 'Evolução mensal: ' . ($context['main_metric'] ?? 'métrica'),
                     'description' => 'Série temporal agregada por mês.',
                     'labels' => $mLabels,
                     'values' => $mValues,
-                ];
+                ]);
             }
 
             // variação percentual
@@ -1066,13 +1366,13 @@ class AnalysisEngine
                     $pct = $prev != 0.0 ? (($cur - $prev) / $prev) * 100.0 : null;
                     $pctValues[] = $pct === null ? 0.0 : (float)$pct;
                 }
-                $charts[] = [
+                $push([
                     'chart_type' => 'bar',
                     'title' => 'Variação percentual: ' . ($context['main_metric'] ?? 'métrica'),
                     'description' => 'Variação percentual entre períodos consecutivos (em %).',
                     'labels' => $pctLabels,
                     'values' => $pctValues,
-                ];
+                ]);
             }
 
             if (count($values) >= 2) {
@@ -1084,26 +1384,26 @@ class AnalysisEngine
                     $cur = (float)$values[$i];
                     $deltas[] = $cur - $prev;
                 }
-                $charts[] = [
+                $push([
                     'chart_type' => 'bar',
                     'title' => 'Variação (delta): ' . ($context['main_metric'] ?? 'métrica'),
                     'description' => 'Diferença absoluta entre períodos consecutivos.',
                     'labels' => $deltaLabels,
                     'values' => $deltas,
-                ];
+                ]);
             }
 
             // forecast simples se disponível
             if (!empty($analytics['temporal']['forecast'])) {
                 $f = $analytics['temporal']['forecast'];
                 if (!empty($f['labels']) && !empty($f['values']) && count($f['labels']) === count($f['values'])) {
-                    $charts[] = [
+                    $push([
                         'chart_type' => 'line',
                         'title' => 'Projeção simples: ' . ($context['main_metric'] ?? 'métrica'),
                         'description' => 'Extrapolação linear simples (baseada na série observada).',
                         'labels' => $f['labels'],
                         'values' => $f['values'],
-                    ];
+                    ]);
                 }
             }
         }
@@ -1149,14 +1449,20 @@ class AnalysisEngine
             arsort($dur);
             $dur = array_slice($dur, 0, 20, true);
             if (!empty($dur)) {
-                $charts[] = [
+                $push([
                     'chart_type' => 'gantt',
                     'title' => 'Gantt (duração em dias)',
                     'description' => 'Gráfico tipo Gantt (best-effort) representado como duração total (dias) por item.',
                     'labels' => array_keys($dur),
                     'values' => array_values($dur),
-                ];
+                ]);
             }
+        }
+
+        // Limite e ordem: evita excesso e mantém legibilidade
+        $maxCharts = 12;
+        if (count($charts) > $maxCharts) {
+            $charts = array_slice($charts, 0, $maxCharts);
         }
 
         return $charts;
