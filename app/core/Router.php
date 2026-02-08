@@ -7,6 +7,18 @@ class Router
         $controllerName = $_GET['c'] ?? 'auth';
         $actionName     = $_GET['a'] ?? 'login';
 
+        if (in_array($controllerName, ['plans', 'asaas'], true)) {
+            http_response_code(404);
+            echo 'Not found';
+            exit;
+        }
+
+        if ($controllerName === 'admin' && in_array($actionName, ['plans', 'editPlan', 'deletePlan'], true)) {
+            http_response_code(404);
+            echo 'Not found';
+            exit;
+        }
+
         $controllerClass = ucfirst($controllerName) . 'Controller';
         $controllerFile  = __DIR__ . '/../controllers/' . $controllerClass . '.php';
 

@@ -99,18 +99,6 @@
 
                 <label><?= Lang::get('OpenAI API Key') ?></label>
                 <input class="input" name="api_key" value="<?= htmlspecialchars($apiKeyValue) ?>" placeholder="sk-...">
-
-                <label>Asaas Sandbox API Key</label>
-                <input class="input" name="asaas_sandbox_key" value="<?= htmlspecialchars($asaasSandboxKeyValue ?? '') ?>" placeholder="sandbox_...">
-
-                <label>Asaas Production API Key</label>
-                <input class="input" name="asaas_production_key" value="<?= htmlspecialchars($asaasProductionKeyValue ?? '') ?>" placeholder="prod_...">
-
-                <label>Asaas Environment</label>
-                <select class="input" name="asaas_env">
-                    <option value="sandbox" <?= ($asaasEnvValue ?? 'sandbox') === 'sandbox' ? 'selected' : '' ?>>Sandbox</option>
-                    <option value="production" <?= ($asaasEnvValue ?? 'sandbox') === 'production' ? 'selected' : '' ?>>Production</option>
-                </select>
             </section>
             <?php endif; ?>
 
@@ -133,39 +121,6 @@
             </section>
 
             <button class="btn-primary" type="submit"><?= Lang::get('Save Changes') ?></button>
-        </form>
-
-        <form method="post" action="<?= BASE_URL ?>?c=asaas&a=subscribePremium" style="margin-top:16px;">
-            <section class="section">
-                <div class="section-title">Assinatura do Plano Premium</div>
-                <div class="section-subtitle">Preencha seus dados para assinar o plano Premium mensal via Asaas.</div>
-
-                <label>Nome completo</label>
-                <input class="input" name="full_name" value="<?= htmlspecialchars($userRow['full_name'] ?? '') ?>" required>
-
-                <label>CPF</label>
-                <input class="input" name="cpf" placeholder="000.000.000-00" required>
-
-                <label>Telefone</label>
-                <input class="input" name="phone" placeholder="(00) 00000-0000" required>
-
-                <label>Nome impresso no cartão</label>
-                <input class="input" name="card_holder_name" placeholder="Como aparece no cartão" required>
-
-                <label>Número do cartão</label>
-                <input class="input" name="card_number" placeholder="0000 0000 0000 0000" required>
-
-                <label>Validade (mês/ano)</label>
-                <div style="display:flex;gap:8px;">
-                    <input class="input" name="card_exp_month" placeholder="MM" style="max-width:80px;" required>
-                    <input class="input" name="card_exp_year" placeholder="AAAA" style="max-width:120px;" required>
-                </div>
-
-                <label>CVV</label>
-                <input class="input" name="card_cvv" placeholder="CVV" style="max-width:120px;" required>
-            </section>
-
-            <button class="btn-primary" type="submit">Assinar Premium</button>
         </form>
     </main>
 </div>

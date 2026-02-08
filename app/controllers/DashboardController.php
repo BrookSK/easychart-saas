@@ -2,7 +2,8 @@
 
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../core/Database.php';
-require_once __DIR__ . '/../helpers/PlanHelper.php';
+require_once __DIR__ . '/../helpers/DataIngestionHelper.php';
+require_once __DIR__ . '/../helpers/AnalysisEngine.php';
 
 class DashboardController
 {
@@ -22,6 +23,8 @@ class DashboardController
         $lastChartResponse = null;
         // Agora suportamos múltiplos gráficos por requisição
         $chartsData = [];
+        $analysisReportText = null;
+        $analysisReportId = null;
 
         // Trata envio do AI Chart Generator
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -30,11 +33,7 @@ class DashboardController
 
             // Upload opcional de novo arquivo direto pelo dashboard
             if (isset($_FILES['spreadsheet']) && $_FILES['spreadsheet']['error'] === UPLOAD_ERR_OK) {
-                // Respeita o mesmo limite de upload de planilhas do plano atual
-                [$canUpload, $planUploadError] = PlanHelper::canUploadSpreadsheet($pdo, (int)$user['id']);
-                if (!$canUpload) {
-                    $error = $planUploadError;
-                } else {
+                if (!$error) {
                     $originalName = $_FILES['spreadsheet']['name'];
                     $tmpName      = $_FILES['spreadsheet']['tmp_name'];
                     $mimeType     = $_FILES['spreadsheet']['type'];
@@ -66,26 +65,11 @@ class DashboardController
             }
 
             if (!$error) {
-                // Verifica limite de gráficos do plano atual (considerando que esta requisição pode gerar vários gráficos)
-                // Por simplicidade, assumimos ao menos 1 gráfico por requisição
-                [$canGenerate, $planChartError] = PlanHelper::canGenerateCharts($pdo, (int)$user['id'], 1);
-                if (!$canGenerate) {
-                    $error = $planChartError;
-                }
-            }
-
-            if (!$error) {
                 if ($spreadsheetId <= 0) {
                     $error = 'Please select or upload a file.';
                 } elseif ($prompt === '') {
                     $error = 'Please describe what you want to visualize.';
                 } else {
-                    // Tenta chamar API de IA, se houver API key configurada
-                    $aiPayload = [
-                        'status' => 'generated_stub',
-                        'reason' => 'No AI call executed.',
-                    ];
-
                     // Descobre caminho do arquivo selecionado
                     $sheetStmt = $pdo->prepare('SELECT stored_name, original_name, mime_type, size_bytes FROM spreadsheets WHERE id = :id AND user_id = :uid');
                     $sheetStmt->execute(['id' => $spreadsheetId, 'uid' => $user['id']]);
@@ -94,200 +78,41 @@ class DashboardController
                     if ($sheet) {
                         $filePath = __DIR__ . '/../../storage/spreadsheets/' . $sheet['stored_name'];
 
-                        // Para arquivos genéricos (PDF, DOCX, etc.), não assumimos estrutura tabular.
-                        // Enviamos apenas metadados e, opcionalmente, um pequeno preview binário em base64
-                        // para a IA ter contexto. A IA deve retornar os dados completos dos gráficos
-                        // (labels e values) já prontos.
-
-                        $filePreviewBase64 = null;
-                        $structuredPreview = null;
-
-                        if (is_file($filePath)) {
-                            // Preview binário curto para qualquer tipo de arquivo
-                            $raw = @file_get_contents($filePath, false, null, 0, 8192);
-                            if ($raw !== false) {
-                                $filePreviewBase64 = base64_encode($raw);
-                            }
-
-                            // Quando possível, tentamos extrair uma visão estruturada dos dados
-                            $ext = strtolower(pathinfo($sheet['original_name'], PATHINFO_EXTENSION));
-
-                            if ($ext === 'csv') {
-                                // Lê o CSV inteiro (todas as linhas) para fornecer uma visão completa à IA
-                                if (($handle = fopen($filePath, 'r')) !== false) {
-                                    $headers = fgetcsv($handle, 0, ',');
-                                    $rows    = [];
-                                    while (($row = fgetcsv($handle, 0, ',')) !== false) {
-                                        $rows[] = $row;
-                                    }
-                                    fclose($handle);
-
-                                    if (!empty($headers) && !empty($rows)) {
-                                        $structuredPreview = [
-                                            'type'    => 'csv',
-                                            'headers' => $headers,
-                                            'rows'    => $rows,
-                                        ];
-                                    }
-                                }
-                            } elseif ($ext === 'xml') {
-                                // Extrai todos os nós filhos de primeiro nível de um XML simples
-                                libxml_use_internal_errors(true);
-                                $xml = simplexml_load_file($filePath);
-                                if ($xml !== false) {
-                                    $items = [];
-                                    foreach ($xml->children() as $child) {
-                                        $item = [];
-                                        // Atributos
-                                        foreach ($child->attributes() as $k => $v) {
-                                            $item[(string)$k] = (string)$v;
-                                        }
-                                        // Filhos de primeiro nível
-                                        foreach ($child->children() as $ck => $cv) {
-                                            $item[(string)$ck] = (string)$cv;
-                                        }
-                                        if (!empty($item)) {
-                                            $items[] = $item;
-                                        }
-                                    }
-
-                                    if (!empty($items)) {
-                                        $structuredPreview = [
-                                            'type'  => 'xml',
-                                            'items' => $items,
-                                        ];
-                                    }
-                                }
-                                libxml_clear_errors();
-                            } elseif (in_array($ext, ['xlsx', 'docx'], true)) {
-                                // Arquivos Office: mantemos apenas metadados e preview binário.
-                                // A IA deve inferir o conteúdo a partir disso.
-                                $structuredPreview = [
-                                    'type' => $ext,
-                                    'note' => 'Office file; server did not parse full structure. Use your own parsing to infer labels from the file contents.',
-                                ];
-                            }
-                        }
-
-                        // Lê API key do usuário
-                        $apiStmt = $pdo->prepare("SELECT api_key FROM api_configs WHERE user_id = :uid AND provider = 'openai' LIMIT 1");
-                        $apiStmt->execute(['uid' => $user['id']]);
-                        $apiRow = $apiStmt->fetch();
-
-                        if ($apiRow && !empty($apiRow['api_key'])) {
-                            $apiKey = $apiRow['api_key'];
-
-                            // Monta prompt para IA
-                            // Agora a IA deve devolver um objeto JSON com um array "charts",
-                            // contendo todos os dados necessários para renderizar vários gráficos.
-                            // Quando "structured_preview" estiver presente (ex.: CSV/XML), a IA
-                            // deve usar os valores reais (por exemplo, nomes de produtos) como labels,
-                            // evitando rótulos genéricos como "Product A", "Product B".
-                            $systemPrompt = 'You are an assistant that designs ONE OR MORE chart configurations '
-                                . 'based on a user request and the contents of an uploaded file. '
-                                . 'You receive file metadata, an optional base64 preview, and sometimes a "structured_preview" '
-                                . 'containing real headers and sample rows (for CSV/XML). '
-                                . 'When structured_preview is present, ALWAYS use the real values from it as labels '
-                                . '(for example, real product names or dates) instead of generic names like "Product A". '
-                                . 'Return ONLY a JSON object with a top-level "charts" array. '
-                                . 'Each item in "charts" MUST have the fields: '
-                                . 'chart_type (string, e.g. line, bar), '
-                                . 'title (string), '
-                                . 'description (string), '
-                                . 'labels (array of x-axis labels as strings), '
-                                . 'values (array of numeric values, same length as labels).';
-
-                            $userPrompt = [
-                                'user_request'       => $prompt,
-                                'file_name'          => $sheet['original_name'],
-                                'mime_type'          => $sheet['mime_type'],
-                                'size_bytes'         => (int)$sheet['size_bytes'],
-                                // Pequeno preview binário em base64 apenas como contexto opcional
-                                'file_preview_base64' => $filePreviewBase64,
-                                // Pré-visualização estruturada (quando disponível: CSV/XML/Office)
-                                'structured_preview' => $structuredPreview,
-                            ];
-
-                            $payload = [
-                                'model' => 'gpt-4o-mini',
-                                'messages' => [
-                                    ['role' => 'system', 'content' => $systemPrompt],
-                                    ['role' => 'user', 'content' => json_encode($userPrompt)],
-                                ],
-                                'response_format' => ['type' => 'json_object'],
-                            ];
-
-                            $ch = curl_init('https://api.openai.com/v1/chat/completions');
-                            curl_setopt_array($ch, [
-                                CURLOPT_RETURNTRANSFER => true,
-                                CURLOPT_POST => true,
-                                CURLOPT_HTTPHEADER => [
-                                    'Content-Type: application/json',
-                                    'Authorization: Bearer ' . $apiKey,
-                                ],
-                                CURLOPT_POSTFIELDS => json_encode($payload),
-                            ]);
-
-                            $responseBody = curl_exec($ch);
-                            $curlErr      = curl_error($ch);
-                            $httpCode     = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-                            curl_close($ch);
-
-                            if ($curlErr) {
-                                $aiPayload = [
-                                    'status' => 'error',
-                                    'error'  => 'Curl error: ' . $curlErr,
-                                ];
-                                $error = 'Failed to contact AI service.';
-                            } elseif ($httpCode < 200 || $httpCode >= 300) {
-                                $aiPayload = [
-                                    'status' => 'error',
-                                    'error'  => 'HTTP ' . $httpCode,
-                                    'body'   => $responseBody,
-                                ];
-                                $error = 'AI service returned an error.';
-                            } else {
-                                $decoded = json_decode($responseBody, true);
-                                $content = $decoded['choices'][0]['message']['content'] ?? null;
-                                if ($content) {
-                                    $parsed = json_decode($content, true);
-                                    if (json_last_error() === JSON_ERROR_NONE) {
-                                        // Normalizamos a resposta para sempre ter um array "charts"
-                                        $chartsList = [];
-                                        if (isset($parsed['charts']) && is_array($parsed['charts'])) {
-                                            $chartsList = $parsed['charts'];
-                                        } elseif (is_array($parsed) && isset($parsed['chart_type'])) {
-                                            // Compatibilidade com resposta de um único gráfico
-                                            $chartsList = [$parsed];
-                                        }
-
-                                        $aiPayload = [
-                                            'status' => 'ok',
-                                            'charts' => $chartsList,
-                                        ];
-                                    } else {
-                                        $aiPayload = [
-                                            'status' => 'error',
-                                            'error'  => 'Invalid JSON from AI.',
-                                            'raw'    => $content,
-                                        ];
-                                        $error = 'AI response could not be parsed.';
-                                    }
-                                } else {
-                                    $aiPayload = [
-                                        'status' => 'error',
-                                        'error'  => 'No content from AI.',
-                                        'raw'    => $decoded,
-                                    ];
-                                    $error = 'AI did not return content.';
-                                }
-                            }
-                        } else {
-                            // sem API key, mantemos stub
+                        $ing = DataIngestionHelper::ingestFile($filePath, (string)$sheet['original_name']);
+                        if (empty($ing['ok']) || empty($ing['table'])) {
                             $aiPayload = [
-                                'status' => 'generated_stub',
-                                'reason' => 'No API key configured. Set it in Settings > API Configuration.',
+                                'status' => 'error',
+                                'error'  => $ing['error'] ?? 'Falha ao extrair dados do arquivo.',
                             ];
+                            $error = $aiPayload['error'];
+                        } else {
+                            $result = AnalysisEngine::run($ing['table'], $prompt);
+
+                            $chartsList = $result['charts'] ?? [];
+                            $aiPayload = [
+                                'status' => 'ok',
+                                'charts' => $chartsList,
+                            ];
+
+                            $analysisReportText = $result['report_text'] ?? null;
+
+                            $datasetProfileToStore = $result['dataset_profile'] ?? null;
+                            if (is_array($datasetProfileToStore) && array_key_exists('sample_rows', $datasetProfileToStore)) {
+                                unset($datasetProfileToStore['sample_rows']);
+                            }
+
+                            $ins = $pdo->prepare('INSERT INTO analysis_reports (user_id, spreadsheet_id, user_request, dataset_profile_json, inferred_context_json, analytics_json, charts_json, report_text) VALUES (:uid, :sid, :req, :dp, :ic, :an, :cj, :rt)');
+                            $ins->execute([
+                                'uid' => (int)$user['id'],
+                                'sid' => (int)$spreadsheetId,
+                                'req' => $prompt,
+                                'dp'  => json_encode($datasetProfileToStore, JSON_UNESCAPED_UNICODE),
+                                'ic'  => json_encode($result['inferred_context'] ?? null, JSON_UNESCAPED_UNICODE),
+                                'an'  => json_encode($result['analytics'] ?? null, JSON_UNESCAPED_UNICODE),
+                                'cj'  => json_encode($chartsList, JSON_UNESCAPED_UNICODE),
+                                'rt'  => $analysisReportText,
+                            ]);
+                            $analysisReportId = (int)$pdo->lastInsertId();
                         }
                     }
 
@@ -313,8 +138,13 @@ class DashboardController
                             }
 
                             if ($labels && $values && count($labels) === count($values)) {
+                                $rawType = $chartConfig['chart_type'] ?? 'line';
+                                $renderType = $rawType;
+                                if (in_array($rawType, ['boxplot', 'gantt'], true)) {
+                                    $renderType = 'bar';
+                                }
                                 $chartsData[] = [
-                                    'type'   => $chartConfig['chart_type'] ?? 'line',
+                                    'type'   => $renderType,
                                     'title'  => $chartConfig['title'] ?? 'Generated chart',
                                     'labels' => $labels,
                                     'values' => $values,
@@ -336,9 +166,9 @@ class DashboardController
                     $lastChartResponse = $aiPayload;
 
                     if ($aiPayload['status'] === 'ok' && !$error) {
-                        $success = 'Charts generated successfully with AI.';
+                        $success = 'Analysis generated successfully.';
                     } elseif (!$error) {
-                        $success = 'Chart generated (stub). Configure API key in Settings for AI-powered charts.';
+                        $success = 'Analysis generated (stub).';
                     }
                 }
             }

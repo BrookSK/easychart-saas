@@ -30,16 +30,6 @@ class SettingsController
         $error = '';
         $success = '';
 
-        // Mensagens de flash vindas de outros fluxos (ex: AsaasController)
-        if (!empty($_SESSION['flash_error'])) {
-            $error = $_SESSION['flash_error'];
-            unset($_SESSION['flash_error']);
-        }
-        if (!empty($_SESSION['flash_success'])) {
-            $success = $_SESSION['flash_success'];
-            unset($_SESSION['flash_success']);
-        }
-
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $fullName = trim($_POST['full_name'] ?? '');
             $email    = trim($_POST['email'] ?? '');
@@ -49,11 +39,6 @@ class SettingsController
             $notifyProduct = isset($_POST['notify_product']) ? 1 : 0;
 
             $apiKey = trim($_POST['api_key'] ?? '');
-
-            // Configurações Asaas (somente super_admin)
-            $asaasSandboxKey    = trim($_POST['asaas_sandbox_key'] ?? '');
-            $asaasProductionKey = trim($_POST['asaas_production_key'] ?? '');
-            $asaasEnv           = trim($_POST['asaas_env'] ?? 'sandbox');
 
             if ($fullName === '') {
                 $error = 'Full name is required.';
@@ -100,45 +85,6 @@ class SettingsController
                     }
                 }
 
-                // Configurações Asaas são definidas pelo super_admin
-                if (isset($user['role']) && $user['role'] === 'super_admin') {
-                    // Sandbox key
-                    $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE user_id = :uid AND provider = 'asaas_sandbox' LIMIT 1");
-                    $stmt->execute(['uid' => $userId]);
-                    $row = $stmt->fetch();
-                    if ($row) {
-                        $stmt = $this->pdo->prepare("UPDATE api_configs SET api_key = :key, updated_at = NOW() WHERE id = :id");
-                        $stmt->execute(['key' => $asaasSandboxKey, 'id' => $row['id']]);
-                    } else {
-                        $stmt = $this->pdo->prepare("INSERT INTO api_configs (user_id, provider, api_key) VALUES (:uid, 'asaas_sandbox', :key)");
-                        $stmt->execute(['uid' => $userId, 'key' => $asaasSandboxKey]);
-                    }
-
-                    // Production key
-                    $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE user_id = :uid AND provider = 'asaas_production' LIMIT 1");
-                    $stmt->execute(['uid' => $userId]);
-                    $row = $stmt->fetch();
-                    if ($row) {
-                        $stmt = $this->pdo->prepare("UPDATE api_configs SET api_key = :key, updated_at = NOW() WHERE id = :id");
-                        $stmt->execute(['key' => $asaasProductionKey, 'id' => $row['id']]);
-                    } else {
-                        $stmt = $this->pdo->prepare("INSERT INTO api_configs (user_id, provider, api_key) VALUES (:uid, 'asaas_production', :key)");
-                        $stmt->execute(['uid' => $userId, 'key' => $asaasProductionKey]);
-                    }
-
-                    // Ambiente atual (sandbox|production) armazenado em api_key
-                    $stmt = $this->pdo->prepare("SELECT id FROM api_configs WHERE user_id = :uid AND provider = 'asaas_env' LIMIT 1");
-                    $stmt->execute(['uid' => $userId]);
-                    $row = $stmt->fetch();
-                    if ($row) {
-                        $stmt = $this->pdo->prepare("UPDATE api_configs SET api_key = :key, updated_at = NOW() WHERE id = :id");
-                        $stmt->execute(['key' => $asaasEnv, 'id' => $row['id']]);
-                    } else {
-                        $stmt = $this->pdo->prepare("INSERT INTO api_configs (user_id, provider, api_key) VALUES (:uid, 'asaas_env', :key)");
-                        $stmt->execute(['uid' => $userId, 'key' => $asaasEnv]);
-                    }
-                }
-
                 $success = 'Settings saved successfully.';
             }
         }
@@ -161,24 +107,6 @@ class SettingsController
         $apiConfig = $stmt->fetch();
 
         $apiKeyValue = $apiConfig ? $apiConfig['api_key'] : '';
-
-        // Configurações Asaas definidas pelo super_admin (associadas ao próprio usuário)
-        $asaasSandboxKeyValue = '';
-        $asaasProductionKeyValue = '';
-        $asaasEnvValue = 'sandbox';
-
-        $stmt = $this->pdo->prepare("SELECT provider, api_key FROM api_configs WHERE user_id = :uid AND provider IN ('asaas_sandbox','asaas_production','asaas_env')");
-        $stmt->execute(['uid' => $userId]);
-        $rows = $stmt->fetchAll();
-        foreach ($rows as $row) {
-            if ($row['provider'] === 'asaas_sandbox') {
-                $asaasSandboxKeyValue = $row['api_key'];
-            } elseif ($row['provider'] === 'asaas_production') {
-                $asaasProductionKeyValue = $row['api_key'];
-            } elseif ($row['provider'] === 'asaas_env') {
-                $asaasEnvValue = $row['api_key'];
-            }
-        }
 
         require __DIR__ . '/../views/settings/index.php';
     }

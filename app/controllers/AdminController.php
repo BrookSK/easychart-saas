@@ -166,4 +166,28 @@ class AdminController
 
         require __DIR__ . '/../views/admin/user.php';
     }
+
+    public function plans()
+    {
+        $this->requireSuperAdmin();
+        http_response_code(404);
+        echo 'Not found';
+        exit;
+    }
+
+    public function editPlan()
+    {
+        $this->requireSuperAdmin();
+        http_response_code(404);
+        echo 'Not found';
+        exit;
+    }
+
+    public function deletePlan()
+    {
+        $this->requireSuperAdmin();
+        http_response_code(404);
+        echo 'Not found';
+        exit;
+    }
 }

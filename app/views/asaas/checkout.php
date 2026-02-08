@@ -1,4 +1,9 @@
-﻿<?php require_once __DIR__ . '/../../config/config.php'; ?>
+﻿<?php 
+require_once __DIR__ . '/../../config/config.php'; 
+http_response_code(404); 
+echo 'Not found';
+exit;
+?>
 <!DOCTYPE html>
 <html lang="pt-BR">
 

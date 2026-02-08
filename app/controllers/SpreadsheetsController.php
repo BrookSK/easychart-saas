@@ -2,7 +2,6 @@
 
 require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../core/Database.php';
-require_once __DIR__ . '/../helpers/PlanHelper.php';
 
 class SpreadsheetsController
 {
@@ -31,11 +30,7 @@ class SpreadsheetsController
 
         // Upload
         if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['spreadsheet'])) {
-            // Verifica limite de uploads do plano atual
-            [$allowed, $planError] = PlanHelper::canUploadSpreadsheet($this->pdo, $userId);
-            if (!$allowed) {
-                $error = $planError;
-            } elseif ($_FILES['spreadsheet']['error'] === UPLOAD_ERR_OK) {
+            if ($_FILES['spreadsheet']['error'] === UPLOAD_ERR_OK) {
                 $originalName = $_FILES['spreadsheet']['name'];
                 $tmpName      = $_FILES['spreadsheet']['tmp_name'];
                 $mimeType     = $_FILES['spreadsheet']['type'];

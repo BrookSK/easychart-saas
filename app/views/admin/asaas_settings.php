@@ -1,6 +1,8 @@
-<?php require_once __DIR__ . '/../../config/config.php'; ?>
-<!DOCTYPE html>
-<html lang="pt-BR">
+<?php
+http_response_code(404);
+echo 'Not found';
+exit;
+?>
 <head>
     <meta charset="UTF-8">
     <title>EasyChart - Configurações Asaas</title>

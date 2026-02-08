@@ -1,6 +1,8 @@
-<?php require_once __DIR__ . '/../../config/config.php'; ?>
-<!DOCTYPE html>
-<html lang="pt-BR">
+<?php
+http_response_code(404);
+echo 'Not found';
+exit;
+?>
 <head>
     <meta charset="UTF-8">
     <title>EasyChart - <?= isset($plan['id']) ? 'Editar plano' : 'Novo plano' ?></title>
@@ -53,6 +55,9 @@
 
             <label>Gráficos gerados por mês (deixe em branco para ilimitado)</label>
             <input class="input" name="monthly_chart_limit" type="number" min="0" step="1" value="<?= $plan['monthly_chart_limit'] !== null ? (int)$plan['monthly_chart_limit'] : '' ?>">
+
+            <label>Tokens por mês (deixe em branco para ilimitado)</label>
+            <input class="input" name="monthly_token_limit" type="number" min="0" step="1" value="<?= $plan['monthly_token_limit'] !== null ? (int)$plan['monthly_token_limit'] : '' ?>">
 
             <div class="checkbox-row">
                 <input type="checkbox" id="is_active" name="is_active" value="1" <?= !empty($plan['is_active']) ? 'checked' : '' ?>>
