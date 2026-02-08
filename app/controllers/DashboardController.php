@@ -26,6 +26,7 @@ class DashboardController
         $analysisReportText = null;
         $analysisReportId = null;
         $clarificationQuestions = [];
+        $decisionLog = null;
 
         // Trata envio do AI Chart Generator
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -96,7 +97,25 @@ class DashboardController
                             ];
                             $error = $aiPayload['error'];
                         } else {
+                            // Aplica overrides persistidos (aprendizado contextual) antes do processamento
+                            try {
+                                $ovStmt = $pdo->prepare('SELECT overrides_json FROM analysis_overrides WHERE user_id = :uid AND spreadsheet_id = :sid ORDER BY updated_at DESC, created_at DESC LIMIT 1');
+                                $ovStmt->execute(['uid' => (int)$user['id'], 'sid' => (int)$spreadsheetId]);
+                                $ovRow = $ovStmt->fetch();
+                                if ($ovRow && !empty($ovRow['overrides_json'])) {
+                                    $persisted = json_decode((string)$ovRow['overrides_json'], true);
+                                    if (is_array($persisted)) {
+                                        // POST tem precedência
+                                        $overrides = array_merge($persisted, $overrides);
+                                    }
+                                }
+                            } catch (PDOException $e) {
+                                // Se a tabela não existir ainda, seguimos sem aprendizado.
+                            }
+
                             $result = AnalysisEngine::run($ing['table'], $prompt, $overrides);
+
+                            $decisionLog = $result['decision_log'] ?? null;
 
                             $needsClarification = !empty($result['needs_clarification']);
                             if ($needsClarification) {
@@ -151,6 +170,26 @@ class DashboardController
                                         $error = 'Missing database table `analysis_reports`. Please run migration: database/20260207_000002_create_analysis_reports.sql';
                                     } else {
                                         throw $e;
+                                    }
+                                }
+
+                                // Persiste overrides informados pelo usuário para reutilização futura
+                                $toPersist = [];
+                                foreach (['amount_column', 'date_column', 'category_column', 'finance_mode'] as $k) {
+                                    if (isset($overrides[$k]) && trim((string)$overrides[$k]) !== '') {
+                                        $toPersist[$k] = trim((string)$overrides[$k]);
+                                    }
+                                }
+                                if (!empty($toPersist)) {
+                                    try {
+                                        $up = $pdo->prepare('INSERT INTO analysis_overrides (user_id, spreadsheet_id, overrides_json) VALUES (:uid, :sid, :oj)');
+                                        $up->execute([
+                                            'uid' => (int)$user['id'],
+                                            'sid' => (int)$spreadsheetId,
+                                            'oj' => json_encode($toPersist, JSON_UNESCAPED_UNICODE),
+                                        ]);
+                                    } catch (PDOException $e) {
+                                        // tabela pode não existir ainda; ignore.
                                     }
                                 }
                             }
@@ -212,6 +251,7 @@ class DashboardController
                         $lastChartResponse['report_text'] = $result['report_text'] ?? null;
                         $lastChartResponse['stages'] = $result['stages'] ?? null;
                         $lastChartResponse['dashboard_plan'] = $result['dashboard_plan'] ?? null;
+                        $lastChartResponse['decision_log'] = $result['decision_log'] ?? null;
                     }
 
                     if (!$error) {

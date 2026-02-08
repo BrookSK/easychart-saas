@@ -25,16 +25,32 @@ class AnalysisEngine
             self::applyOverrides($cleanHeaders, $typed, $profile, $overrides, $columnMap, $requestPlan, $context);
         }
 
+        // ETAPA 4/6: Motor de consistência (score global + ambiguidades + fallbacks governados)
+        $consistency = self::consistencyEngine($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context);
+        self::applyAutoSelection($consistency, $columnMap, $requestPlan, $context);
+        // Recalcula após autopick para atualizar confiança global e bloqueios
+        $consistency = self::consistencyEngine($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context);
+        if (!empty($consistency['force_conservative'])) {
+            $requestPlan['force_conservative'] = true;
+        }
+        if (!empty($consistency['disable_blocks']) && is_array($consistency['disable_blocks'])) {
+            $requestPlan['disable_blocks'] = $consistency['disable_blocks'];
+        }
+
         // Gate de confiabilidade: se houver ambiguidade relevante, perguntamos antes de gerar gráficos.
-        $clarification = self::buildClarificationQuestions($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context);
+        $clarification = self::buildClarificationQuestions($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context, $consistency);
+
+        $decisionLog = self::buildDecisionLog($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context, $clarification, $consistency);
         if (!empty($clarification['needs_clarification'])) {
             return [
                 'needs_clarification' => true,
                 'questions' => $clarification['questions'] ?? [],
+                'decision_log' => $decisionLog,
                 'dataset_profile' => $profile,
                 'inferred_context' => $context,
                 'column_map' => $columnMap,
                 'request_plan' => $requestPlan,
+                'analytic_plan' => null,
                 'dashboard_plan' => null,
                 'analytics' => null,
                 'charts' => [],
@@ -60,6 +76,65 @@ class AnalysisEngine
             ];
         }
 
+        // ETAPA 8/9: Plano analítico executável + validação anti-lixo
+        $analyticPlan = self::buildAnalyticPlan($cleanHeaders, $typed, $profile, $requestPlan, $context, $columnMap);
+        $planValidation = self::validateAnalyticPlan($analyticPlan, $profile);
+        $analyticPlan['validation'] = $planValidation;
+        $requestPlan['analytic_plan'] = $analyticPlan;
+
+        // Fallback automático: se group_by tiver cardinalidade alta demais, degradamos o plano.
+        $issues = $planValidation['issues'] ?? [];
+        if (is_array($issues)) {
+            foreach ($issues as $it) {
+                $t = (string)($it['type'] ?? '');
+                if ($t === 'group_by_too_high_cardinality') {
+                    $analyticPlan['group_by'] = null;
+                    if (!isset($analyticPlan['validation']) || !is_array($analyticPlan['validation'])) {
+                        $analyticPlan['validation'] = [];
+                    }
+                    $analyticPlan['validation']['fallback_applied'] = 'removed_group_by_high_cardinality';
+                    $requestPlan['analytic_plan'] = $analyticPlan;
+
+                    $requestPlan['force_conservative'] = true;
+                    if (!isset($requestPlan['disable_blocks']) || !is_array($requestPlan['disable_blocks'])) {
+                        $requestPlan['disable_blocks'] = [];
+                    }
+                    $requestPlan['disable_blocks']['time_series'] = true;
+                    $requestPlan['disable_blocks']['forecast'] = true;
+                    $requestPlan['disable_blocks']['finance'] = true;
+                    $requestPlan['disable_blocks']['gantt'] = true;
+                    break;
+                }
+            }
+        }
+
+        // Governança anti-lixo: se o plano não é executável com segurança, degradamos automaticamente.
+        if (empty($planValidation['ok'])) {
+            $requestPlan['force_conservative'] = true;
+            if (!isset($requestPlan['disable_blocks']) || !is_array($requestPlan['disable_blocks'])) {
+                $requestPlan['disable_blocks'] = [];
+            }
+            $requestPlan['disable_blocks']['time_series'] = true;
+            $requestPlan['disable_blocks']['forecast'] = true;
+            $requestPlan['disable_blocks']['finance'] = true;
+            $requestPlan['disable_blocks']['gantt'] = true;
+        }
+        if (!empty($analyticPlan['metric_op'])) {
+            $requestPlan['agg'] = $analyticPlan['metric_op'];
+        }
+        if (!empty($analyticPlan['limit'])) {
+            $requestPlan['limit'] = (int)$analyticPlan['limit'];
+        }
+        if (!empty($analyticPlan['group_by'])) {
+            $context['main_entity'] = $analyticPlan['group_by'];
+        }
+        if (!empty($analyticPlan['metric_column'])) {
+            $context['main_metric'] = $analyticPlan['metric_column'];
+        }
+        if (!empty($analyticPlan['time_axis'])) {
+            $context['time_axis'] = $analyticPlan['time_axis'];
+        }
+
         // ETAPA 2: O que é relevante (insights/indicadores) para o pedido
         $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan, $columnMap);
         $dashboardPlan = self::buildDashboardPlan($profile, $context, $analytics, $requestPlan, $columnMap);
@@ -74,10 +149,12 @@ class AnalysisEngine
         return [
             'needs_clarification' => false,
             'questions' => [],
+            'decision_log' => $decisionLog,
             'dataset_profile' => $profile,
             'inferred_context' => $context,
             'column_map' => $columnMap,
             'request_plan' => $requestPlan,
+            'analytic_plan' => $analyticPlan,
             'dashboard_plan' => $dashboardPlan,
             'analytics' => $analytics,
             'charts' => $charts,
@@ -98,6 +175,10 @@ class AnalysisEngine
                 '2' => [
                     'title' => 'Seleção de informações relevantes e recomendações',
                     'dashboard_plan' => $dashboardPlan,
+                ],
+                'plan' => [
+                    'title' => 'Plano analítico (executável) + validação',
+                    'analytic_plan' => $analyticPlan,
                 ],
                 '3' => [
                     'title' => 'Criação dos gráficos específicos',
@@ -131,22 +212,41 @@ class AnalysisEngine
             return null;
         };
 
+        if (!isset($requestPlan['locked_roles']) || !is_array($requestPlan['locked_roles'])) {
+            $requestPlan['locked_roles'] = [];
+        }
+
         $amount = $resolveHeader($overrides['amount_column'] ?? null);
         if ($amount !== null) {
             $columnMap['amount'] = ['column' => $amount, 'confidence' => 1.0];
             $context['main_metric'] = $amount;
+            $requestPlan['locked_roles']['amount'] = true;
+            if (!isset($requestPlan['role_origin']) || !is_array($requestPlan['role_origin'])) {
+                $requestPlan['role_origin'] = [];
+            }
+            $requestPlan['role_origin']['amount'] = 'user_override';
         }
 
         $date = $resolveHeader($overrides['date_column'] ?? null);
         if ($date !== null) {
             $columnMap['date'] = ['column' => $date, 'confidence' => 1.0];
             $context['time_axis'] = $date;
+            $requestPlan['locked_roles']['date'] = true;
+            if (!isset($requestPlan['role_origin']) || !is_array($requestPlan['role_origin'])) {
+                $requestPlan['role_origin'] = [];
+            }
+            $requestPlan['role_origin']['date'] = 'user_override';
         }
 
         $category = $resolveHeader($overrides['category_column'] ?? null);
         if ($category !== null) {
             $columnMap['category'] = ['column' => $category, 'confidence' => 1.0];
             $context['main_entity'] = $category;
+            $requestPlan['locked_roles']['category'] = true;
+            if (!isset($requestPlan['role_origin']) || !is_array($requestPlan['role_origin'])) {
+                $requestPlan['role_origin'] = [];
+            }
+            $requestPlan['role_origin']['category'] = 'user_override';
         }
 
         if ($forceConservative) {
@@ -160,7 +260,7 @@ class AnalysisEngine
         }
     }
 
-    private static function buildClarificationQuestions(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context): array
+    private static function buildClarificationQuestions(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context, array $consistency): array
     {
         if ((bool)($requestPlan['force_conservative'] ?? false)) {
             return ['needs_clarification' => false, 'questions' => []];
@@ -168,12 +268,24 @@ class AnalysisEngine
 
         $questions = [];
 
+        $hyp = $consistency['hypotheses'] ?? [];
+        if (!is_array($hyp)) {
+            $hyp = [];
+        }
+        $topScore = function(string $role) use ($hyp): float {
+            $list = $hyp[$role] ?? [];
+            if (!is_array($list) || empty($list)) {
+                return 0.0;
+            }
+            return (float)($list[0]['score'] ?? 0.0);
+        };
+
         $amountCol = $columnMap['amount']['column'] ?? null;
-        $amountConf = (float)($columnMap['amount']['confidence'] ?? 0.0);
+        $amountConf = max((float)($columnMap['amount']['confidence'] ?? 0.0), $topScore('amount'));
         $dateCol = $columnMap['date']['column'] ?? null;
-        $dateConf = (float)($columnMap['date']['confidence'] ?? 0.0);
+        $dateConf = max((float)($columnMap['date']['confidence'] ?? 0.0), $topScore('date'));
         $catCol = $columnMap['category']['column'] ?? null;
-        $catConf = (float)($columnMap['category']['confidence'] ?? 0.0);
+        $catConf = max((float)($columnMap['category']['confidence'] ?? 0.0), $topScore('category'));
 
         $intents = $requestPlan['intents'] ?? ['auto'];
         if (!is_array($intents) || empty($intents)) {
@@ -195,57 +307,683 @@ class AnalysisEngine
             }
         }
 
-        // 1) Valor principal
-        if ($amountCol === null || $amountCol === '' || $amountConf < 0.72) {
-            if (!empty($numericCols)) {
+        $ambiguities = $consistency['ambiguities'] ?? [];
+        if (!is_array($ambiguities)) {
+            $ambiguities = [];
+        }
+
+        $impactRank = [
+            'amount' => 3,
+            'date' => 2,
+            'category' => 1,
+        ];
+        usort($ambiguities, function($a, $b) use ($impactRank){
+            $ra = $impactRank[(string)($a['role'] ?? '')] ?? 0;
+            $rb = $impactRank[(string)($b['role'] ?? '')] ?? 0;
+            return $rb <=> $ra;
+        });
+
+        $asked = [];
+        foreach ($ambiguities as $amb) {
+            $role = (string)($amb['role'] ?? '');
+            if ($role === '' || isset($asked[$role])) {
+                continue;
+            }
+            $amountOpts = [];
+            if (!empty($hyp['amount']) && is_array($hyp['amount'])) {
+                foreach ($hyp['amount'] as $h) {
+                    if (!empty($h['column'])) {
+                        $amountOpts[] = (string)$h['column'];
+                    }
+                }
+            }
+            if (empty($amountOpts)) {
+                $amountOpts = $numericCols;
+            }
+
+            $dateOpts = [];
+            if (!empty($hyp['date']) && is_array($hyp['date'])) {
+                foreach ($hyp['date'] as $h) {
+                    if (!empty($h['column'])) {
+                        $dateOpts[] = (string)$h['column'];
+                    }
+                }
+            }
+            if (empty($dateOpts)) {
+                $dateOpts = $temporalCols;
+            }
+
+            $catOpts = [];
+            if (!empty($hyp['category']) && is_array($hyp['category'])) {
+                foreach ($hyp['category'] as $h) {
+                    if (!empty($h['column'])) {
+                        $catOpts[] = (string)$h['column'];
+                    }
+                }
+            }
+            if (empty($catOpts)) {
+                $catOpts = array_slice($categoricalCols, 0, 40);
+            }
+
+            if ($role === 'amount' && !empty($amountOpts) && ($amountCol === null || $amountCol === '' || $amountConf < 0.85)) {
                 $questions[] = [
                     'id' => 'amount_column',
                     'type' => 'select',
                     'label' => 'Qual coluna representa o VALOR principal?',
-                    'why' => 'Sem isso, ganhos/perdas e rankings podem ficar incorretos.',
-                    'options' => $numericCols,
+                    'why' => 'Isso muda rankings, ganhos/perdas e análises financeiras.',
+                    'options' => array_values(array_unique($amountOpts)),
                     'default' => is_string($amountCol) ? $amountCol : null,
                 ];
+                $asked[$role] = true;
             }
-        }
-
-        // 2) Eixo temporal (se solicitado)
-        if ($wantsTime && ($dateCol === null || $dateCol === '' || $dateConf < 0.72)) {
-            if (!empty($temporalCols)) {
+            if ($role === 'date' && $wantsTime && !empty($dateOpts) && ($dateCol === null || $dateCol === '' || $dateConf < 0.85)) {
                 $questions[] = [
                     'id' => 'date_column',
                     'type' => 'select',
                     'label' => 'Qual coluna representa a DATA principal?',
-                    'why' => 'Sem isso, linha do tempo e previsibilidade podem ficar incorretas.',
-                    'options' => $temporalCols,
+                    'why' => 'Isso muda linha do tempo e previsões.',
+                    'options' => array_values(array_unique($dateOpts)),
                     'default' => is_string($dateCol) ? $dateCol : null,
                 ];
+                $asked[$role] = true;
             }
-        }
-
-        // 3) Dimensão/categoria
-        if ($catCol === null || $catCol === '' || $catConf < 0.60) {
-            if (!empty($categoricalCols)) {
+            if ($role === 'category' && !empty($catOpts) && ($catCol === null || $catCol === '' || $catConf < 0.70)) {
                 $questions[] = [
                     'id' => 'category_column',
                     'type' => 'select',
                     'label' => 'Qual coluna devo usar como CATEGORIA/DIMENSÃO para agrupar?',
-                    'why' => 'Isso muda completamente os rankings e gráficos de participação.',
-                    'options' => array_slice($categoricalCols, 0, 40),
+                    'why' => 'Isso muda completamente rankings e participação.',
+                    'options' => array_values(array_unique($catOpts)),
                     'default' => is_string($catCol) ? $catCol : null,
                 ];
+                $asked[$role] = true;
             }
-        }
 
-        // Limite de perguntas (UX)
-        if (count($questions) > 3) {
-            $questions = array_slice($questions, 0, 3);
+            if (count($questions) >= 2) {
+                break;
+            }
         }
 
         return [
             'needs_clarification' => !empty($questions),
             'questions' => $questions,
         ];
+    }
+
+    private static function buildDecisionLog(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context, array $clarification, array $consistency): array
+    {
+        $checks = [];
+
+        $colIndex = function(?string $name) use ($headers) {
+            if (!is_string($name) || $name === '') {
+                return false;
+            }
+            return array_search($name, $headers, true);
+        };
+
+        $sampleRows = $profile['sample_rows'] ?? [];
+        if (!is_array($sampleRows)) {
+            $sampleRows = [];
+        }
+
+        $columnQuality = function(int $idx, string $expectedType) use ($sampleRows): array {
+            $n = 0;
+            $nonEmpty = 0;
+            $ok = 0;
+            foreach ($sampleRows as $row) {
+                $n++;
+                $v = isset($row[$idx]) ? trim((string)$row[$idx]) : '';
+                if ($v === '') {
+                    continue;
+                }
+                $nonEmpty++;
+                if ($expectedType === 'numerica') {
+                    if (self::parseNumber($v) !== null) {
+                        $ok++;
+                    }
+                } elseif ($expectedType === 'temporal') {
+                    if (self::parseDate($v) !== null) {
+                        $ok++;
+                    }
+                } else {
+                    $ok++;
+                }
+            }
+
+            $completeness = $n > 0 ? ($nonEmpty / $n) : 0.0;
+            $validRatio = $nonEmpty > 0 ? ($ok / $nonEmpty) : 0.0;
+            return [
+                'sample_n' => $n,
+                'non_empty' => $nonEmpty,
+                'completeness' => round($completeness, 3),
+                'valid_ratio' => round($validRatio, 3),
+            ];
+        };
+
+        $amountCol = $columnMap['amount']['column'] ?? null;
+        $dateCol = $columnMap['date']['column'] ?? null;
+        $catCol = $columnMap['category']['column'] ?? null;
+
+        $origin = $requestPlan['role_origin'] ?? [];
+        if (!is_array($origin)) {
+            $origin = [];
+        }
+        $originDefault = function(string $role) use ($origin): string {
+            $v = $origin[$role] ?? '';
+            if ($v === 'user_override' || $v === 'autopick') {
+                return $v;
+            }
+            return 'heuristic';
+        };
+
+        $amountIdx = $colIndex(is_string($amountCol) ? $amountCol : null);
+        if ($amountIdx !== false) {
+            $checks['amount_quality'] = $columnQuality((int)$amountIdx, 'numerica');
+        }
+        $dateIdx = $colIndex(is_string($dateCol) ? $dateCol : null);
+        if ($dateIdx !== false) {
+            $checks['date_quality'] = $columnQuality((int)$dateIdx, 'temporal');
+        }
+        $catIdx = $colIndex(is_string($catCol) ? $catCol : null);
+        if ($catIdx !== false) {
+            $checks['category_quality'] = $columnQuality((int)$catIdx, 'categorica');
+        }
+
+        $intents = $requestPlan['intents'] ?? [];
+        if (!is_array($intents)) {
+            $intents = [];
+        }
+
+        return [
+            'dataset_quality' => [
+                'quality_score' => $profile['quality_score'] ?? null,
+                'structure' => $profile['structure'] ?? null,
+            ],
+            'consistency' => [
+                'confidence_global' => $consistency['confidence_global'] ?? null,
+                'disable_blocks' => $consistency['disable_blocks'] ?? null,
+                'ambiguities' => $consistency['ambiguities'] ?? null,
+                'notes' => $consistency['notes'] ?? null,
+            ],
+            'analytic_plan' => $requestPlan['analytic_plan'] ?? null,
+            'mode' => [
+                'force_conservative' => (bool)($requestPlan['force_conservative'] ?? false),
+            ],
+            'selected' => [
+                'amount' => [
+                    'column' => $amountCol,
+                    'confidence' => (float)($columnMap['amount']['confidence'] ?? 0.0),
+                    'origin' => $originDefault('amount'),
+                ],
+                'date' => [
+                    'column' => $dateCol,
+                    'confidence' => (float)($columnMap['date']['confidence'] ?? 0.0),
+                    'origin' => $originDefault('date'),
+                ],
+                'category' => [
+                    'column' => $catCol,
+                    'confidence' => (float)($columnMap['category']['confidence'] ?? 0.0),
+                    'origin' => $originDefault('category'),
+                ],
+            ],
+            'context' => [
+                'main_metric' => $context['main_metric'] ?? null,
+                'main_entity' => $context['main_entity'] ?? null,
+                'time_axis' => $context['time_axis'] ?? null,
+                'intents' => $intents,
+            ],
+            'checks' => $checks,
+            'clarification' => [
+                'needs_clarification' => (bool)($clarification['needs_clarification'] ?? false),
+                'question_ids' => array_values(array_filter(array_map(function($q){
+                    return is_array($q) ? (string)($q['id'] ?? '') : '';
+                }, $clarification['questions'] ?? []))),
+            ],
+        ];
+    }
+
+    private static function consistencyEngine(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context): array
+    {
+        $qualityScore = (float)($profile['quality_score'] ?? 0.0);
+        $columnProfiles = $profile['column_profiles'] ?? [];
+        if (!is_array($columnProfiles)) {
+            $columnProfiles = [];
+        }
+
+        $hypotheses = [
+            'amount' => self::rankRoleHypotheses('amount', $headers, $columnProfiles),
+            'date' => self::rankRoleHypotheses('date', $headers, $columnProfiles),
+            'category' => self::rankRoleHypotheses('category', $headers, $columnProfiles),
+        ];
+
+        $roleScore = function(string $role) use ($hypotheses): float {
+            $list = $hypotheses[$role] ?? [];
+            if (!is_array($list) || empty($list)) {
+                return 0.0;
+            }
+            return (float)($list[0]['score'] ?? 0.0);
+        };
+
+        $isClose = function(string $role, float $margin) use ($hypotheses): bool {
+            $list = $hypotheses[$role] ?? [];
+            if (!is_array($list) || count($list) < 2) {
+                return false;
+            }
+            $a = (float)($list[0]['score'] ?? 0.0);
+            $b = (float)($list[1]['score'] ?? 0.0);
+            return ($a > 0.0) && (($a - $b) <= $margin);
+        };
+
+        $amountCol = $columnMap['amount']['column'] ?? null;
+        $amountConf = (float)($columnMap['amount']['confidence'] ?? 0.0);
+        $dateCol = $columnMap['date']['column'] ?? null;
+        $dateConf = (float)($columnMap['date']['confidence'] ?? 0.0);
+        $catCol = $columnMap['category']['column'] ?? null;
+        $catConf = (float)($columnMap['category']['confidence'] ?? 0.0);
+
+        $amountOk = 0.0;
+        if (is_string($amountCol) && isset($columnProfiles[$amountCol])) {
+            $p = $columnProfiles[$amountCol];
+            $amountOk = min(1.0, (float)($p['numeric_ratio'] ?? 0.0)) * min(1.0, (float)($p['completeness'] ?? 0.0));
+        }
+        $dateOk = 0.0;
+        if (is_string($dateCol) && isset($columnProfiles[$dateCol])) {
+            $p = $columnProfiles[$dateCol];
+            $dateOk = min(1.0, (float)($p['date_ratio'] ?? 0.0)) * min(1.0, (float)($p['completeness'] ?? 0.0));
+        }
+        $catOk = 0.0;
+        if (is_string($catCol) && isset($columnProfiles[$catCol])) {
+            $p = $columnProfiles[$catCol];
+            // categoria útil raramente é quase única; penaliza unique_ratio muito alto
+            $uniq = (float)($p['unique_ratio'] ?? 0.0);
+            $pen = $uniq >= 0.85 ? 0.55 : ($uniq >= 0.70 ? 0.75 : 1.0);
+            $catOk = min(1.0, (float)($p['completeness'] ?? 0.0)) * $pen;
+        }
+
+        $confidenceGlobal = (0.35 * $qualityScore)
+            + (0.30 * min(1.0, $amountConf) * $amountOk)
+            + (0.20 * min(1.0, $dateConf) * $dateOk)
+            + (0.15 * min(1.0, $catConf) * $catOk);
+        $confidenceGlobal = max(0.0, min(1.0, $confidenceGlobal));
+
+        // Penalização explícita por ambiguidade: top2 muito próximo => alto risco semântico.
+        $ambiguityPenalty = 1.0;
+        $closeAmount = $isClose('amount', 0.08);
+        $closeDate = $isClose('date', 0.08);
+        $closeCategory = $isClose('category', 0.08);
+        if ($closeAmount) {
+            $ambiguityPenalty *= 0.88;
+        }
+        if ($closeDate) {
+            $ambiguityPenalty *= 0.92;
+        }
+        if ($closeCategory) {
+            $ambiguityPenalty *= 0.94;
+        }
+        $confidenceGlobal = $confidenceGlobal * $ambiguityPenalty;
+        $confidenceGlobal = max(0.0, min(1.0, $confidenceGlobal));
+        $confidenceGlobal = round($confidenceGlobal, 3);
+
+        $disable = [
+            'time_series' => false,
+            'forecast' => false,
+            'finance' => false,
+            'gantt' => false,
+        ];
+
+        $ambiguities = [];
+        if ($amountConf < 0.75 || $amountOk < 0.75) {
+            $ambiguities[] = ['role' => 'amount', 'reason' => 'low_confidence_or_quality'];
+        } elseif ($isClose('amount', 0.08)) {
+            $ambiguities[] = ['role' => 'amount', 'reason' => 'top2_close'];
+        }
+        if ($dateConf < 0.75 || $dateOk < 0.75) {
+            $ambiguities[] = ['role' => 'date', 'reason' => 'low_confidence_or_quality'];
+        } elseif ($isClose('date', 0.08)) {
+            $ambiguities[] = ['role' => 'date', 'reason' => 'top2_close'];
+        }
+        if ($catConf < 0.60 || $catOk < 0.60) {
+            $ambiguities[] = ['role' => 'category', 'reason' => 'low_confidence_or_quality'];
+        } elseif ($isClose('category', 0.08)) {
+            $ambiguities[] = ['role' => 'category', 'reason' => 'top2_close'];
+        }
+
+        // Governança por risco (sem perguntar)
+        if ($qualityScore < 0.60) {
+            $disable['time_series'] = true;
+            $disable['forecast'] = true;
+            $disable['gantt'] = true;
+        }
+
+        // Se houver ambiguidade em papéis críticos, degradamos blocos de alto custo de erro
+        if ($closeAmount) {
+            $disable['finance'] = true;
+        }
+        if ($closeDate) {
+            $disable['forecast'] = true;
+        }
+        if (($dateConf < 0.80 || $dateOk < 0.80) && !empty($requestPlan['intents']) && is_array($requestPlan['intents']) && in_array('time_series', $requestPlan['intents'], true)) {
+            $disable['time_series'] = true;
+            $disable['forecast'] = true;
+        }
+        if ($dateConf < 0.85 || $dateOk < 0.85) {
+            $disable['forecast'] = true;
+        }
+        if ($amountConf < 0.85 || $amountOk < 0.85) {
+            $disable['finance'] = true;
+        }
+        if ($confidenceGlobal < 0.60) {
+            $disable['time_series'] = true;
+            $disable['forecast'] = true;
+            $disable['finance'] = true;
+            $disable['gantt'] = true;
+        }
+
+        $forceConservative = false;
+        if ($confidenceGlobal < 0.60) {
+            $forceConservative = true;
+        }
+
+        $notes = [];
+        if ($forceConservative) {
+            $notes[] = 'force_conservative_low_confidence';
+        }
+        if ($qualityScore < 0.60) {
+            $notes[] = 'low_dataset_quality';
+        }
+        if ($ambiguityPenalty < 1.0) {
+            $notes[] = 'ambiguity_penalty_applied';
+        }
+        if ($closeAmount) {
+            $notes[] = 'ambiguous_amount_top2_close';
+        }
+        if ($closeDate) {
+            $notes[] = 'ambiguous_date_top2_close';
+        }
+        if ($closeCategory) {
+            $notes[] = 'ambiguous_category_top2_close';
+        }
+
+        if (!empty($requestPlan['autopick']) && is_array($requestPlan['autopick'])) {
+            $notes[] = 'autopick_applied';
+        }
+
+        return [
+            'confidence_global' => $confidenceGlobal,
+            'ambiguities' => $ambiguities,
+            'hypotheses' => $hypotheses,
+            'ambiguity_penalty' => round($ambiguityPenalty, 3),
+            'disable_blocks' => $disable,
+            'force_conservative' => $forceConservative,
+            'notes' => $notes,
+        ];
+    }
+
+    private static function applyAutoSelection(array $consistency, array &$columnMap, array &$requestPlan, array &$context): void
+    {
+        $locked = $requestPlan['locked_roles'] ?? [];
+        if (!is_array($locked)) {
+            $locked = [];
+        }
+
+        $hyp = $consistency['hypotheses'] ?? [];
+        if (!is_array($hyp)) {
+            return;
+        }
+
+        $applyRole = function(string $role, string $contextKey) use (&$columnMap, &$requestPlan, &$context, $locked, $hyp): void {
+            if (!empty($locked[$role])) {
+                return;
+            }
+            $list = $hyp[$role] ?? [];
+            if (!is_array($list) || empty($list)) {
+                return;
+            }
+
+            $best = $list[0];
+            $bestCol = (string)($best['column'] ?? '');
+            $bestScore = (float)($best['score'] ?? 0.0);
+            if ($bestCol === '' || $bestScore <= 0.0) {
+                return;
+            }
+
+            $curCol = $columnMap[$role]['column'] ?? null;
+            $curConf = (float)($columnMap[$role]['confidence'] ?? 0.0);
+
+            // Só auto-seleciona quando for claramente superior e com score mínimo
+            if ($bestScore >= 0.60 && ($curCol === null || $curCol === '' || $bestScore >= ($curConf + 0.10))) {
+                $columnMap[$role] = ['column' => $bestCol, 'confidence' => max($curConf, min(1.0, $bestScore))];
+                $context[$contextKey] = $bestCol;
+                if (!isset($requestPlan['autopick']) || !is_array($requestPlan['autopick'])) {
+                    $requestPlan['autopick'] = [];
+                }
+                $requestPlan['autopick'][$role] = [
+                    'from' => $curCol,
+                    'to' => $bestCol,
+                    'score' => round($bestScore, 3),
+                ];
+                if (!isset($requestPlan['role_origin']) || !is_array($requestPlan['role_origin'])) {
+                    $requestPlan['role_origin'] = [];
+                }
+                if (empty($requestPlan['role_origin'][$role])) {
+                    $requestPlan['role_origin'][$role] = 'autopick';
+                }
+            }
+        };
+
+        $applyRole('amount', 'main_metric');
+        $applyRole('date', 'time_axis');
+        $applyRole('category', 'main_entity');
+    }
+
+    private static function buildAnalyticPlan(array $headers, array $types, array $profile, array $requestPlan, array $context, array $columnMap): array
+    {
+        $intents = $requestPlan['intents'] ?? ['auto'];
+        if (!is_array($intents) || empty($intents)) {
+            $intents = ['auto'];
+        }
+
+        $metricOp = $requestPlan['agg'] ?? null;
+        if (!is_string($metricOp) || $metricOp === '') {
+            $metricOp = 'sum';
+        }
+        if (!in_array($metricOp, ['sum', 'avg', 'count'], true)) {
+            $metricOp = 'sum';
+        }
+
+        $groupBy = $requestPlan['entity'] ?? ($context['main_entity'] ?? null);
+        if (!is_string($groupBy) || $groupBy === '') {
+            $groupBy = null;
+        }
+
+        $metricColumn = $requestPlan['metric'] ?? ($context['main_metric'] ?? null);
+        if (!is_string($metricColumn) || $metricColumn === '') {
+            $metricColumn = $columnMap['amount']['column'] ?? null;
+        }
+        if (!is_string($metricColumn) || $metricColumn === '') {
+            $metricColumn = null;
+        }
+        if ($metricOp === 'count') {
+            $metricColumn = null;
+        }
+
+        $timeAxis = $requestPlan['time_axis'] ?? ($context['time_axis'] ?? null);
+        if (!is_string($timeAxis) || $timeAxis === '') {
+            $timeAxis = null;
+        }
+
+        $limit = $requestPlan['limit'] ?? null;
+        $limit = is_numeric($limit) ? (int)$limit : null;
+        if ($limit !== null && $limit <= 0) {
+            $limit = null;
+        }
+        if ($limit === null) {
+            $limit = 20;
+        }
+        $limit = min(50, max(5, $limit));
+
+        $order = 'desc';
+        if (preg_match('/\b(menores|piores|ascendente|menor\s+para\s+maior)\b/u', mb_strtolower((string)($requestPlan['raw'] ?? '')))) {
+            $order = 'asc';
+        }
+
+        $bucket = null;
+        if ($timeAxis !== null && (in_array('time_series', $intents, true) || in_array('auto', $intents, true))) {
+            $bucket = 'day';
+            if (preg_match('/\b(mensal|por\s*m[êe]s|monthly)\b/u', mb_strtolower((string)($requestPlan['raw'] ?? '')))) {
+                $bucket = 'month';
+            }
+        }
+
+        return [
+            'group_by' => $groupBy,
+            'metric_op' => $metricOp,
+            'metric_column' => $metricColumn,
+            'time_axis' => $timeAxis,
+            'time_bucket' => $bucket,
+            'order' => $order,
+            'limit' => $limit,
+        ];
+    }
+
+    private static function validateAnalyticPlan(array $analyticPlan, array $profile): array
+    {
+        $issues = [];
+        $ok = true;
+
+        $columnProfiles = $profile['column_profiles'] ?? [];
+        if (!is_array($columnProfiles)) {
+            $columnProfiles = [];
+        }
+
+        $groupBy = $analyticPlan['group_by'] ?? null;
+        if (is_string($groupBy) && isset($columnProfiles[$groupBy])) {
+            $p = $columnProfiles[$groupBy];
+            $uniq = (float)($p['unique_ratio'] ?? 0.0);
+            $comp = (float)($p['completeness'] ?? 0.0);
+            if ($comp < 0.50) {
+                $ok = false;
+                $issues[] = ['type' => 'group_by_low_completeness', 'column' => $groupBy, 'value' => $comp];
+            }
+            if ($uniq > 0.90) {
+                $issues[] = ['type' => 'group_by_too_high_cardinality', 'column' => $groupBy, 'value' => $uniq];
+            }
+        }
+
+        $metricOp = (string)($analyticPlan['metric_op'] ?? 'sum');
+        $metricColumn = $analyticPlan['metric_column'] ?? null;
+        if ($metricOp !== 'count') {
+            if (!is_string($metricColumn) || $metricColumn === '') {
+                $ok = false;
+                $issues[] = ['type' => 'missing_metric_column', 'value' => null];
+            } elseif (isset($columnProfiles[$metricColumn])) {
+                $p = $columnProfiles[$metricColumn];
+                $num = (float)($p['numeric_ratio'] ?? 0.0);
+                $comp = (float)($p['completeness'] ?? 0.0);
+                if ($num < 0.70) {
+                    $ok = false;
+                    $issues[] = ['type' => 'metric_not_numeric_enough', 'column' => $metricColumn, 'value' => $num];
+                }
+                if ($comp < 0.50) {
+                    $issues[] = ['type' => 'metric_low_completeness', 'column' => $metricColumn, 'value' => $comp];
+                }
+            }
+        }
+
+        $timeAxis = $analyticPlan['time_axis'] ?? null;
+        if (is_string($timeAxis) && isset($columnProfiles[$timeAxis])) {
+            $p = $columnProfiles[$timeAxis];
+            $dr = (float)($p['date_ratio'] ?? 0.0);
+            $comp = (float)($p['completeness'] ?? 0.0);
+            if ($comp < 0.40) {
+                $issues[] = ['type' => 'time_axis_low_completeness', 'column' => $timeAxis, 'value' => $comp];
+            }
+            if ($dr < 0.70) {
+                $issues[] = ['type' => 'time_axis_low_date_ratio', 'column' => $timeAxis, 'value' => $dr];
+            }
+        }
+
+        return [
+            'ok' => $ok,
+            'issues' => $issues,
+        ];
+    }
+
+    private static function rankRoleHypotheses(string $role, array $headers, array $columnProfiles): array
+    {
+        $out = [];
+        foreach ($headers as $h) {
+            $name = (string)$h;
+            $p = $columnProfiles[$name] ?? null;
+            if (!is_array($p)) {
+                continue;
+            }
+            $score = 0.0;
+            $signals = [];
+
+            $lower = mb_strtolower($name);
+
+            if ($role === 'amount') {
+                $num = (float)($p['numeric_ratio'] ?? 0.0);
+                $comp = (float)($p['completeness'] ?? 0.0);
+                $uniq = (float)($p['unique_ratio'] ?? 0.0);
+                $cur = (int)(($p['signals']['currency'] ?? 0));
+                $score = (0.55 * $num) + (0.25 * $comp);
+                if ($cur > 0) {
+                    $score += 0.10;
+                    $signals[] = 'currency_signal';
+                }
+                if ($uniq >= 0.95) {
+                    $score -= 0.25;
+                    $signals[] = 'very_high_unique_ratio';
+                }
+                if (preg_match('/\b(valor|amount|total|pre[cç]o|price|receita|revenue|gasto|despesa|custo|pagamento|pago|saldo)\b/u', $lower)) {
+                    $score += 0.20;
+                    $signals[] = 'header_match_money';
+                }
+            } elseif ($role === 'date') {
+                $dr = (float)($p['date_ratio'] ?? 0.0);
+                $comp = (float)($p['completeness'] ?? 0.0);
+                $score = (0.70 * $dr) + (0.20 * $comp);
+                if (preg_match('/\b(data|date|dt|dia|mes|m[êe]s|ano|timestamp|created_at|updated_at|venc|vencimento|emiss[aã]o|pagamento)\b/u', $lower)) {
+                    $score += 0.10;
+                    $signals[] = 'header_match_date';
+                }
+            } elseif ($role === 'category') {
+                $comp = (float)($p['completeness'] ?? 0.0);
+                $uniq = (float)($p['unique_ratio'] ?? 0.0);
+                $len = (float)($p['avg_len'] ?? 0.0);
+                // categoria útil: não pode ser quase única; e texto não muito longo
+                $pen = $uniq >= 0.90 ? 0.35 : ($uniq >= 0.75 ? 0.70 : 1.0);
+                $lenPen = $len >= 60 ? 0.70 : 1.0;
+                $score = (0.55 * $comp) * $pen * $lenPen;
+                if (preg_match('/\b(categoria|category|grupo|group|tipo|type|centro\s*de\s*custo|cc|natureza|conta|account|fornecedor|cliente)\b/u', $lower)) {
+                    $score += 0.25;
+                    $signals[] = 'header_match_category';
+                }
+                if (preg_match('/\b(descri[cç][aã]o|descricao|hist[oó]rico|memo|observa[cç][aã]o|detalhe|item|lan[cç]amento)\b/u', $lower)) {
+                    $score += 0.05;
+                    $signals[] = 'header_match_description';
+                }
+            }
+
+            $score = max(0.0, min(1.0, $score));
+            if ($score <= 0.0) {
+                continue;
+            }
+
+            $out[] = [
+                'column' => $name,
+                'score' => round($score, 3),
+                'signals' => $signals,
+            ];
+        }
+
+        usort($out, function($a, $b){
+            return ((float)($b['score'] ?? 0.0)) <=> ((float)($a['score'] ?? 0.0));
+        });
+
+        return array_slice($out, 0, 5);
     }
 
     private static function inferColumnTypes(array $headers, array $rows): array
@@ -337,6 +1075,10 @@ class AnalysisEngine
 
         $sampleRows = array_slice($rows, 0, min(200, count($rows)));
 
+        $structure = self::profileStructure($headers, $rows);
+        $columnProfiles = self::profileColumnsNeutral($headers, $rows);
+        $qualityScore = self::computeDatasetQualityScore($structure, $columnProfiles);
+
         return [
             'columns' => $colList,
             'volume' => [
@@ -344,8 +1086,142 @@ class AnalysisEngine
                 'columns' => count($headers),
             ],
             'period' => $period,
+            'structure' => $structure,
+            'column_profiles' => $columnProfiles,
+            'quality_score' => $qualityScore,
             'sample_rows' => $sampleRows,
         ];
+    }
+
+    private static function profileStructure(array $headers, array $rows): array
+    {
+        $expectedCols = count($headers);
+        $n = min(500, count($rows));
+        $ok = 0;
+        $minCols = null;
+        $maxCols = null;
+        for ($i = 0; $i < $n; $i++) {
+            $c = is_array($rows[$i] ?? null) ? count($rows[$i]) : 0;
+            if ($minCols === null || $c < $minCols) {
+                $minCols = $c;
+            }
+            if ($maxCols === null || $c > $maxCols) {
+                $maxCols = $c;
+            }
+            if ($expectedCols > 0 && $c === $expectedCols) {
+                $ok++;
+            }
+        }
+        $ratio = $n > 0 ? ($ok / $n) : 0.0;
+        return [
+            'expected_columns' => $expectedCols,
+            'sample_rows' => $n,
+            'row_width_min' => $minCols,
+            'row_width_max' => $maxCols,
+            'row_width_consistency' => round($ratio, 3),
+        ];
+    }
+
+    private static function profileColumnsNeutral(array $headers, array $rows): array
+    {
+        $n = min(500, count($rows));
+        $out = [];
+
+        for ($i = 0; $i < count($headers); $i++) {
+            $total = 0;
+            $nonEmpty = 0;
+            $unique = [];
+            $numericOk = 0;
+            $dateOk = 0;
+            $lenSum = 0;
+
+            $signals = [
+                'email' => 0,
+                'cpf_cnpj' => 0,
+                'phone' => 0,
+                'currency' => 0,
+                'url' => 0,
+            ];
+
+            for ($r = 0; $r < $n; $r++) {
+                $total++;
+                $v = isset($rows[$r][$i]) ? trim((string)$rows[$r][$i]) : '';
+                if ($v === '') {
+                    continue;
+                }
+                $nonEmpty++;
+                $low = mb_strtolower($v);
+                $unique[$low] = true;
+                $lenSum += mb_strlen($v);
+
+                if (self::parseNumber($v) !== null) {
+                    $numericOk++;
+                }
+                if (self::parseDate($v) !== null) {
+                    $dateOk++;
+                }
+                if (preg_match('/\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i', $v)) {
+                    $signals['email']++;
+                }
+                if (preg_match('/\b\d{3}\.\d{3}\.\d{3}-\d{2}\b|\b\d{11}\b|\b\d{2}\.\d{3}\.\d{3}\/\d{4}-\d{2}\b|\b\d{14}\b/', $v)) {
+                    $signals['cpf_cnpj']++;
+                }
+                if (preg_match('/\b\+?\d{1,3}\s*\(?\d{2}\)?\s*\d{4,5}[-\s]?\d{4}\b/', $v)) {
+                    $signals['phone']++;
+                }
+                if (preg_match('/(R\$|\$|€|£)\s*[-+]?\d/u', $v)) {
+                    $signals['currency']++;
+                }
+                if (preg_match('/\bhttps?:\/\//i', $v)) {
+                    $signals['url']++;
+                }
+            }
+
+            $completeness = $total > 0 ? ($nonEmpty / $total) : 0.0;
+            $uniqueRatio = $nonEmpty > 0 ? (count($unique) / $nonEmpty) : 0.0;
+            $numericRatio = $nonEmpty > 0 ? ($numericOk / $nonEmpty) : 0.0;
+            $dateRatio = $nonEmpty > 0 ? ($dateOk / $nonEmpty) : 0.0;
+            $avgLen = $nonEmpty > 0 ? ($lenSum / $nonEmpty) : 0.0;
+
+            $out[(string)$headers[$i]] = [
+                'completeness' => round($completeness, 3),
+                'unique_ratio' => round($uniqueRatio, 3),
+                'numeric_ratio' => round($numericRatio, 3),
+                'date_ratio' => round($dateRatio, 3),
+                'avg_len' => round($avgLen, 1),
+                'signals' => $signals,
+            ];
+        }
+
+        return $out;
+    }
+
+    private static function computeDatasetQualityScore(array $structure, array $columnProfiles): float
+    {
+        $rowConsistency = (float)($structure['row_width_consistency'] ?? 0.0);
+        $expectedCols = (int)($structure['expected_columns'] ?? 0);
+        $completenessAvg = 0.0;
+        $n = 0;
+        foreach ($columnProfiles as $p) {
+            $completenessAvg += (float)($p['completeness'] ?? 0.0);
+            $n++;
+        }
+        $completenessAvg = $n > 0 ? ($completenessAvg / $n) : 0.0;
+
+        $headerQuality = 0.0;
+        if ($expectedCols > 0) {
+            $nonEmpty = 0;
+            foreach (array_keys($columnProfiles) as $h) {
+                if (trim((string)$h) !== '') {
+                    $nonEmpty++;
+                }
+            }
+            $headerQuality = $expectedCols > 0 ? ($nonEmpty / $expectedCols) : 0.0;
+        }
+
+        $score = (0.55 * $rowConsistency) + (0.30 * $completenessAvg) + (0.15 * $headerQuality);
+        $score = max(0.0, min(1.0, $score));
+        return round($score, 3);
     }
 
     private static function inferContext(array $headers, array $types, array $profile, array $requestPlan, array $columnMap): array
@@ -1074,6 +1950,11 @@ class AnalysisEngine
                 'time_axis' => $timeAxis,
             ],
             'column_map' => $columnMap,
+            'analytic_plan' => $requestPlan['analytic_plan'] ?? null,
+            'governance' => [
+                'force_conservative' => (bool)($requestPlan['force_conservative'] ?? false),
+                'disable_blocks' => $requestPlan['disable_blocks'] ?? null,
+            ],
             'kpis' => $kpis,
             'recommended_outputs' => $recommended,
         ];
@@ -1086,6 +1967,13 @@ class AnalysisEngine
         $temporalStats = [];
         $comparisons = [];
         $finance = [];
+
+        $disable = $requestPlan['disable_blocks'] ?? [];
+        if (!is_array($disable)) {
+            $disable = [];
+        }
+        $disableFinance = !empty($disable['finance']);
+        $disableTimeSeries = !empty($disable['time_series']);
 
         foreach ($types as $i => $t) {
             $name = $headers[$i] ?? ('col_' . ($i + 1));
@@ -1140,87 +2028,132 @@ class AnalysisEngine
         $entity = $context['main_entity'] ?? null;
         $aggPref = $requestPlan['agg'] ?? null;
 
-        // Ganhos x Perdas: tenta usar coluna amount (mapeada) e sinais (+/-)
-        $amountCol = $columnMap['amount']['column'] ?? null;
-        if (is_string($amountCol) && $amountCol !== '') {
-            $aIdx = array_search($amountCol, $headers, true);
-            if ($aIdx !== false) {
-                $sumPos = 0.0;
-                $sumNeg = 0.0;
-                $countPos = 0;
-                $countNeg = 0;
+        $plan = $requestPlan['analytic_plan'] ?? [];
+        if (!is_array($plan)) {
+            $plan = [];
+        }
+        $metricOp = (string)($plan['metric_op'] ?? ($aggPref ?: 'sum'));
+        $metricColumn = $plan['metric_column'] ?? $metric;
+        if ($metricOp === 'count') {
+            $metricColumn = null;
+        }
+
+        if (!$disableFinance) {
+            // Ganhos x Perdas: tenta usar coluna amount (mapeada) e sinais (+/-)
+            $amountCol = $columnMap['amount']['column'] ?? null;
+            if (is_string($amountCol) && $amountCol !== '') {
+                $aIdx = array_search($amountCol, $headers, true);
+                if ($aIdx !== false) {
+                    $sumPos = 0.0;
+                    $sumNeg = 0.0;
+                    $countPos = 0;
+                    $countNeg = 0;
+                    foreach ($rows as $row) {
+                        $v = isset($row[$aIdx]) ? self::parseNumber((string)$row[$aIdx]) : null;
+                        if ($v === null) {
+                            continue;
+                        }
+                        if ($v >= 0) {
+                            $sumPos += (float)$v;
+                            $countPos++;
+                        } else {
+                            $sumNeg += (float)$v;
+                            $countNeg++;
+                        }
+                    }
+
+                    if (($countPos + $countNeg) > 0) {
+                        $finance['cashflow'] = [
+                            'amount_column' => $amountCol,
+                            'sum_positive' => $sumPos,
+                            'sum_negative' => $sumNeg,
+                            'net' => $sumPos + $sumNeg,
+                            'count_positive' => $countPos,
+                            'count_negative' => $countNeg,
+                        ];
+            }
+            if ($entityIdx !== false) {
+                $agg = [];
+                $counts = [];
                 foreach ($rows as $row) {
-                    $v = isset($row[$aIdx]) ? self::parseNumber((string)$row[$aIdx]) : null;
+                    $k = isset($row[$entityIdx]) ? trim((string)$row[$entityIdx]) : '';
+                    if ($k === '') {
+                        continue;
+                    }
+
+                    if ($metricOp === 'count') {
+                        if (!isset($agg[$k])) {
+                            $agg[$k] = 0.0;
+                        }
+                        $agg[$k] += 1.0;
+                        continue;
+                    }
+
+                    if ($metricIdx === null || $metricIdx === false) {
+                        continue;
+                    }
+                    $v = isset($row[$metricIdx]) ? self::parseNumber((string)$row[$metricIdx]) : null;
                     if ($v === null) {
                         continue;
                     }
-                    if ($v >= 0) {
-                        $sumPos += (float)$v;
-                        $countPos++;
-                    } else {
-                        $sumNeg += (float)$v;
-                        $countNeg++;
+                    if (!isset($agg[$k])) {
+                        $agg[$k] = 0.0;
+                        $counts[$k] = 0;
                     }
+                    $agg[$k] += (float)$v;
+                    $counts[$k] += 1;
                 }
 
-                if (($countPos + $countNeg) > 0) {
-                    $finance['cashflow'] = [
-                        'amount_column' => $amountCol,
-                        'sum_positive' => $sumPos,
-                        'sum_negative' => $sumNeg,
-                        'net' => $sumPos + $sumNeg,
-                        'count_positive' => $countPos,
-                        'count_negative' => $countNeg,
+                if (!empty($agg)) {
+                    if ($metricOp === 'avg') {
+                        foreach ($agg as $k => $sum) {
+                            $c = (int)($counts[$k] ?? 0);
+                            $agg[$k] = $c > 0 ? ((float)$sum / $c) : 0.0;
+                        }
+                    }
+                    $order = (string)($plan['order'] ?? 'desc');
+                    if ($order === 'asc') {
+                        asort($agg);
+                    } else {
+                        arsort($agg);
+                    }
+                    $total = array_sum($agg);
+                    $topAgg = array_slice($agg, 0, 50, true);
+                    $shares = [];
+                    if ($total > 0) {
+                        foreach ($topAgg as $k => $v) {
+                            $shares[$k] = (float)$v / (float)$total;
+                        }
+                    }
+                    $comparisons['entity_metric_sum'] = [
+                        'entity' => $entity,
+                        'metric' => $metricOp === 'count' ? 'count' : (string)$metricColumn,
+                        'op' => $metricOp,
+                        'top_sum' => $topAgg,
+                        'total_sum' => $total,
+                        'top_shares' => $shares,
                     ];
                 }
             }
         }
 
-        // Comparação entidade x métrica (soma) + participação percentual
-        if ($entity && $metric) {
-            $entityIdx = array_search($entity, $headers, true);
-            $metricIdx = array_search($metric, $headers, true);
-            if ($entityIdx !== false && $metricIdx !== false) {
-                $agg = [];
-                foreach ($rows as $row) {
-                    $k = isset($row[$entityIdx]) ? trim((string)$row[$entityIdx]) : '';
-                    $v = isset($row[$metricIdx]) ? self::parseNumber((string)$row[$metricIdx]) : null;
-                    if ($k === '' || $v === null) {
-                        continue;
-                    }
-                    if (!isset($agg[$k])) {
-                        $agg[$k] = 0.0;
-                    }
-                    $agg[$k] += (float)$v;
-                }
-                arsort($agg);
-                $topAgg = array_slice($agg, 0, 20, true);
-                $total = array_sum($agg);
-                $shares = [];
-                if ($total > 0) {
-                    foreach ($topAgg as $k => $v) {
-                        $shares[$k] = $v / $total;
-                    }
-                }
-
-                $comparisons['entity_metric_sum'] = [
-                    'entity' => $entity,
-                    'metric' => $metric,
-                    'top_sum' => $topAgg,
-                    'total_sum' => $total,
-                    'top_shares' => $shares,
-                ];
-            }
-        }
-        if ($timeAxis && $metric) {
+        if (!$disableTimeSeries && $timeAxis && ($metricOp === 'count' || $metricColumn)) {
             $timeIdx = array_search($timeAxis, $headers, true);
-            $metricIdx = array_search($metric, $headers, true);
-            if ($timeIdx !== false && $metricIdx !== false) {
+            $metricIdx = null;
+            if ($metricOp !== 'count' && is_string($metricColumn) && $metricColumn !== '') {
+                $metricIdx = array_search($metricColumn, $headers, true);
+            }
+            if ($timeIdx !== false && ($metricOp === 'count' || $metricIdx !== false)) {
                 $series = [];
                 $seriesMonthly = [];
                 foreach ($rows as $row) {
                     $d = isset($row[$timeIdx]) ? self::parseDate((string)$row[$timeIdx]) : null;
-                    $v = isset($row[$metricIdx]) ? self::parseNumber((string)$row[$metricIdx]) : null;
+                    $v = null;
+                    if ($metricOp === 'count') {
+                        $v = 1.0;
+                    } else {
+                        $v = ($metricIdx === null || $metricIdx === false) ? null : self::parseNumber((string)($row[$metricIdx] ?? ''));
+                    }
                     if ($d === null || $v === null) {
                         continue;
                     }
@@ -1228,13 +2161,13 @@ class AnalysisEngine
                     if (!isset($series[$key])) {
                         $series[$key] = 0.0;
                     }
-                    $series[$key] += $v;
+                    $series[$key] += (float)$v;
 
                     $mKey = $d->format('Y-m');
                     if (!isset($seriesMonthly[$mKey])) {
                         $seriesMonthly[$mKey] = 0.0;
                     }
-                    $seriesMonthly[$mKey] += $v;
+                    $seriesMonthly[$mKey] += (float)$v;
                 }
                 ksort($series);
                 ksort($seriesMonthly);
@@ -1271,6 +2204,25 @@ class AnalysisEngine
         $wantDistribution = in_array('distribution', $intents, true) || in_array('auto', $intents, true);
         $wantShare = in_array('share', $intents, true) || in_array('auto', $intents, true);
 
+        $disable = $requestPlan['disable_blocks'] ?? [];
+        if (!is_array($disable)) {
+            $disable = [];
+        }
+        $disableFinance = !empty($disable['finance']);
+        $disableTimeSeries = !empty($disable['time_series']);
+        $disableForecast = !empty($disable['forecast']);
+        $disableGantt = !empty($disable['gantt']);
+
+        $plan = $requestPlan['analytic_plan'] ?? [];
+        if (!is_array($plan)) {
+            $plan = [];
+        }
+        $metricOp = (string)($plan['metric_op'] ?? ($requestPlan['agg'] ?? 'sum'));
+        if (!in_array($metricOp, ['sum', 'avg', 'count'], true)) {
+            $metricOp = 'sum';
+        }
+        $metricOpLabel = $metricOp === 'count' ? 'contagem' : ($metricOp === 'avg' ? 'média' : 'soma');
+
         if (!empty($requestPlan['force_conservative'])) {
             // Em modo conservador, evitamos séries temporais/forecast/gantt e distribuições que poluem.
             $wantTime = false;
@@ -1278,7 +2230,7 @@ class AnalysisEngine
         }
 
         // Finance overview (ganhos x perdas / saldo) - aparece cedo para deixar o dashboard claro
-        if (!empty($analytics['finance']['cashflow'])) {
+        if (!$disableFinance && !empty($analytics['finance']['cashflow'])) {
             $cf = $analytics['finance']['cashflow'];
             $pos = (float)($cf['sum_positive'] ?? 0);
             $neg = (float)($cf['sum_negative'] ?? 0);
@@ -1436,8 +2388,8 @@ class AnalysisEngine
 
             $push([
                 'chart_type' => 'bar',
-                'title' => 'Top ' . ($cmp['entity'] ?? 'entidades') . ' por soma de ' . ($cmp['metric'] ?? 'métrica'),
-                'description' => 'Ranking por soma da métrica (top 20).',
+                'title' => 'Top ' . ($cmp['entity'] ?? 'entidades') . ' por ' . $metricOpLabel . ' de ' . ($cmp['metric'] ?? 'métrica'),
+                'description' => 'Ranking por ' . $metricOpLabel . ' da métrica (top ' . (int)$limit . ').',
                 'labels' => array_keys($topAgg),
                 'values' => array_values($topAgg),
             ]);
@@ -1517,13 +2469,13 @@ class AnalysisEngine
             }
         }
 
-        if ($wantTime && !empty($analytics['temporal']['series'])) {
+        if ($wantTime && !$disableTimeSeries && !empty($analytics['temporal']['series'])) {
             $labels = array_keys($analytics['temporal']['series']);
             $values = array_values($analytics['temporal']['series']);
             $push([
                 'chart_type' => 'line',
-                'title' => 'Evolução temporal: ' . ($context['main_metric'] ?? 'métrica'),
-                'description' => 'Série temporal agregada por dia.',
+                'title' => 'Evolução temporal (' . $metricOpLabel . '): ' . ($context['main_metric'] ?? 'métrica'),
+                'description' => 'Série temporal agregada por dia (' . $metricOpLabel . ').',
                 'labels' => $labels,
                 'values' => $values,
             ]);
@@ -1533,8 +2485,8 @@ class AnalysisEngine
                 $mValues = array_values($analytics['temporal']['series_monthly']);
                 $push([
                     'chart_type' => 'line',
-                    'title' => 'Evolução mensal: ' . ($context['main_metric'] ?? 'métrica'),
-                    'description' => 'Série temporal agregada por mês.',
+                    'title' => 'Evolução mensal (' . $metricOpLabel . '): ' . ($context['main_metric'] ?? 'métrica'),
+                    'description' => 'Série temporal agregada por mês (' . $metricOpLabel . ').',
                     'labels' => $mLabels,
                     'values' => $mValues,
                 ]);
@@ -1579,7 +2531,7 @@ class AnalysisEngine
             }
 
             // forecast simples se disponível
-            if (!empty($analytics['temporal']['forecast'])) {
+            if (!$disableForecast && !empty($analytics['temporal']['forecast'])) {
                 $f = $analytics['temporal']['forecast'];
                 if (!empty($f['labels']) && !empty($f['values']) && count($f['labels']) === count($f['values'])) {
                     $push([
@@ -1593,54 +2545,55 @@ class AnalysisEngine
             }
         }
 
-        // Radar foi removido do padrão para não poluir o dashboard analítico.
-
-        // Gantt best-effort: detectar colunas de início/fim e gerar duração por entidade
-        $startIdx = null;
-        $endIdx = null;
-        foreach ($headers as $i => $h) {
-            $hl = mb_strtolower((string)$h);
-            if ($types[$i] === 'temporal' && $startIdx === null && preg_match('/\b(inicio|in[ií]cio|start|data_inicio|dt_inicio)\b/u', $hl)) {
-                $startIdx = $i;
-            }
-            if ($types[$i] === 'temporal' && $endIdx === null && preg_match('/\b(fim|end|data_fim|dt_fim|termino|t[eê]rmino)\b/u', $hl)) {
-                $endIdx = $i;
-            }
-        }
-        if ($startIdx !== null && $endIdx !== null) {
-            $entity = $context['main_entity'] ?? null;
-            $entityIdx = $entity ? array_search($entity, $headers, true) : null;
-            if ($entityIdx === false) {
-                $entityIdx = null;
+        // Gantt best-effort (governado por disable_blocks)
+        if (!$disableGantt) {
+            $startIdx = null;
+            $endIdx = null;
+            foreach ($headers as $i => $h) {
+                $l = mb_strtolower((string)$h);
+                if ($startIdx === null && (strpos($l, 'inicio') !== false || strpos($l, 'início') !== false || strpos($l, 'start') !== false)) {
+                    $startIdx = $i;
+                }
+                if ($endIdx === null && (strpos($l, 'fim') !== false || strpos($l, 'término') !== false || strpos($l, 'termino') !== false || strpos($l, 'end') !== false)) {
+                    $endIdx = $i;
+                }
             }
 
-            $dur = [];
-            foreach ($rows as $row) {
-                $ds = isset($row[$startIdx]) ? self::parseDate((string)$row[$startIdx]) : null;
-                $de = isset($row[$endIdx]) ? self::parseDate((string)$row[$endIdx]) : null;
-                if ($ds === null || $de === null) {
-                    continue;
+            if ($startIdx !== null && $endIdx !== null) {
+                $entity = $context['main_entity'] ?? null;
+                $entityIdx = $entity ? array_search($entity, $headers, true) : null;
+                if ($entityIdx === false) {
+                    $entityIdx = null;
                 }
-                $label = $entityIdx !== null ? trim((string)($row[$entityIdx] ?? '')) : '';
-                if ($label === '') {
-                    $label = $ds->format('Y-m-d') . '→' . $de->format('Y-m-d');
+
+                $dur = [];
+                foreach ($rows as $row) {
+                    $ds = isset($row[$startIdx]) ? self::parseDate((string)$row[$startIdx]) : null;
+                    $de = isset($row[$endIdx]) ? self::parseDate((string)$row[$endIdx]) : null;
+                    if ($ds === null || $de === null) {
+                        continue;
+                    }
+                    $label = $entityIdx !== null ? trim((string)($row[$entityIdx] ?? '')) : '';
+                    if ($label === '') {
+                        $label = $ds->format('Y-m-d') . '→' . $de->format('Y-m-d');
+                    }
+                    $days = (float)max(0, ($de->getTimestamp() - $ds->getTimestamp()) / 86400);
+                    if (!isset($dur[$label])) {
+                        $dur[$label] = 0.0;
+                    }
+                    $dur[$label] += $days;
                 }
-                $days = (float)max(0, ($de->getTimestamp() - $ds->getTimestamp()) / 86400);
-                if (!isset($dur[$label])) {
-                    $dur[$label] = 0.0;
+                arsort($dur);
+                $dur = array_slice($dur, 0, 20, true);
+                if (!empty($dur)) {
+                    $push([
+                        'chart_type' => 'gantt',
+                        'title' => 'Gantt (duração em dias)',
+                        'description' => 'Gráfico tipo Gantt (best-effort) representado como duração total (dias) por item.',
+                        'labels' => array_keys($dur),
+                        'values' => array_values($dur),
+                    ]);
                 }
-                $dur[$label] += $days;
-            }
-            arsort($dur);
-            $dur = array_slice($dur, 0, 20, true);
-            if (!empty($dur)) {
-                $push([
-                    'chart_type' => 'gantt',
-                    'title' => 'Gantt (duração em dias)',
-                    'description' => 'Gráfico tipo Gantt (best-effort) representado como duração total (dias) por item.',
-                    'labels' => array_keys($dur),
-                    'values' => array_values($dur),
-                ]);
             }
         }
 
@@ -1696,6 +2649,73 @@ class AnalysisEngine
 
         $goalHtml = $goal !== '' ? '<div style="margin-top:6px;color:#111827;font-size:14px;"><strong>Objetivo:</strong> ' . htmlspecialchars($goal, ENT_QUOTES, 'UTF-8') . '</div>' : '';
 
+        $analyticPlan = $dashboardPlan['analytic_plan'] ?? null;
+        $gov = $dashboardPlan['governance'] ?? [];
+        if (!is_array($gov)) {
+            $gov = [];
+        }
+
+        $planHtml = '';
+        if (is_array($analyticPlan)) {
+            $validation = $analyticPlan['validation'] ?? [];
+            if (!is_array($validation)) {
+                $validation = [];
+            }
+            $issues = $validation['issues'] ?? [];
+            if (!is_array($issues)) {
+                $issues = [];
+            }
+
+            $planRows = '';
+            $planRows .= '<div><strong>Group by:</strong> ' . htmlspecialchars((string)($analyticPlan['group_by'] ?? '-'), ENT_QUOTES, 'UTF-8') . '</div>';
+            $planRows .= '<div><strong>Métrica:</strong> ' . htmlspecialchars((string)($analyticPlan['metric_op'] ?? '-'), ENT_QUOTES, 'UTF-8') . ' ' . htmlspecialchars((string)($analyticPlan['metric_column'] ?? ''), ENT_QUOTES, 'UTF-8') . '</div>';
+            $planRows .= '<div><strong>Tempo:</strong> ' . htmlspecialchars((string)($analyticPlan['time_axis'] ?? '-'), ENT_QUOTES, 'UTF-8') . ' ' . htmlspecialchars((string)($analyticPlan['time_bucket'] ?? ''), ENT_QUOTES, 'UTF-8') . '</div>';
+            $planRows .= '<div><strong>Ordem:</strong> ' . htmlspecialchars((string)($analyticPlan['order'] ?? '-'), ENT_QUOTES, 'UTF-8') . ' | <strong>Limite:</strong> ' . htmlspecialchars((string)($analyticPlan['limit'] ?? '-'), ENT_QUOTES, 'UTF-8') . '</div>';
+
+            $issuesHtml = '';
+            if (!empty($issues)) {
+                foreach ($issues as $it) {
+                    $issuesHtml .= '<li>' . htmlspecialchars((string)($it['type'] ?? ''), ENT_QUOTES, 'UTF-8') . '</li>';
+                }
+                $issuesHtml = '<div style="margin-top:8px;"><strong>Validação:</strong> ' . (!empty($validation['ok']) ? 'ok' : 'falhou') . '<ol style="margin:6px 0 0 18px;">' . $issuesHtml . '</ol></div>';
+            } else {
+                $issuesHtml = '<div style="margin-top:8px;"><strong>Validação:</strong> ' . (!empty($validation['ok']) ? 'ok' : 'falhou') . '</div>';
+            }
+
+            if (!empty($validation['fallback_applied'])) {
+                $issuesHtml .= '<div style="margin-top:6px;color:#6b7280;font-size:12px;"><strong>Fallback:</strong> ' . htmlspecialchars((string)$validation['fallback_applied'], ENT_QUOTES, 'UTF-8') . '</div>';
+            }
+
+            $planHtml = '<div style="margin-top:16px;padding:12px 14px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;">
+                <div style="font-weight:700;color:#0f172a;margin-bottom:6px;">Plano analítico (executável)</div>
+                <div style="font-size:13px;color:#374151;line-height:1.6;">' . $planRows . $issuesHtml . '</div>
+            </div>';
+        }
+
+        $limitations = '';
+        $disable = $gov['disable_blocks'] ?? [];
+        if (!is_array($disable)) {
+            $disable = [];
+        }
+        $disabledList = [];
+        foreach (['time_series' => 'Série temporal', 'forecast' => 'Forecast', 'finance' => 'Financeiro (ganhos/perdas)', 'gantt' => 'Gantt'] as $k => $label) {
+            if (!empty($disable[$k])) {
+                $disabledList[] = $label;
+            }
+        }
+        if (!empty($gov['force_conservative']) || !empty($disabledList)) {
+            $limitations .= '<div style="margin-top:16px;padding:12px 14px;border:1px solid #e5e7eb;border-radius:14px;background:#fff7ed;">
+                <div style="font-weight:700;color:#9a3412;margin-bottom:6px;">Limitações aplicadas (governança)</div>
+                <div style="font-size:13px;color:#7c2d12;line-height:1.6;">';
+            if (!empty($gov['force_conservative'])) {
+                $limitations .= '<div><strong>Modo conservador:</strong> ativado</div>';
+            }
+            if (!empty($disabledList)) {
+                $limitations .= '<div><strong>Blocos omitidos:</strong> ' . htmlspecialchars(implode(', ', $disabledList), ENT_QUOTES, 'UTF-8') . '</div>';
+            }
+            $limitations .= '</div></div>';
+        }
+
         return '<div style="font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,sans-serif;">
             <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:16px;flex-wrap:wrap;">
                 <div>
@@ -1717,6 +2737,9 @@ class AnalysisEngine
                 </div>
             </div>
 
+            ' . $planHtml . '
+            ' . $limitations . '
+
             <div style="margin-top:16px;padding:12px 14px;border:1px solid #e5e7eb;border-radius:14px;background:#ffffff;">
                 <div style="font-weight:700;color:#0f172a;margin-bottom:6px;">Saídas geradas (gráficos e focos)</div>
                 <ol style="margin:0;padding-left:18px;color:#111827;font-size:13px;line-height:1.6;">' . $chartsList . '</ol>
@@ -1734,6 +2757,15 @@ class AnalysisEngine
             $lines[] = 'Período: ' . ($profile['period']['start'] ?? '') . ' a ' . ($profile['period']['end'] ?? '');
         }
         $lines[] = 'Domínio inferido: ' . ($context['domain'] ?? 'Operacional');
+        $lines[] = '';
+
+        $lines[] = '1.1 Plano analítico e governança';
+        $metric = $context['main_metric'] ?? null;
+        $entity = $context['main_entity'] ?? null;
+        $timeAxis = $context['time_axis'] ?? null;
+        $lines[] = 'Métrica: ' . ($metric ?: '-');
+        $lines[] = 'Dimensão: ' . ($entity ?: '-');
+        $lines[] = 'Eixo temporal: ' . ($timeAxis ?: '-');
         $lines[] = '';
 
         $lines[] = '2. Métricas-Chave';

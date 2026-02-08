@@ -334,6 +334,120 @@
             </section>
         <?php endif; ?>
 
+        <?php if (!empty($decisionLog) && is_array($decisionLog)): ?>
+            <section class="card-large" style="margin-bottom:16px;max-width:980px;">
+                <div class="card-header">
+                    <div>
+                        <div class="card-title">Como decidimos (defensabilidade)</div>
+                        <div class="card-subtitle">Colunas escolhidas, confiança e checagens básicas aplicadas antes dos gráficos.</div>
+                    </div>
+                </div>
+                <?php
+                    $sel = $decisionLog['selected'] ?? [];
+                    $checks = $decisionLog['checks'] ?? [];
+                    $mode = $decisionLog['mode'] ?? [];
+                    $clar = $decisionLog['clarification'] ?? [];
+                    $dq = $decisionLog['dataset_quality'] ?? [];
+                    $cons = $decisionLog['consistency'] ?? [];
+
+                    $fmtPct = function($x){
+                        $v = (float)$x;
+                        return (string)round($v * 100, 1) . '%';
+                    };
+                ?>
+
+                <?php
+                    $disabled = [];
+                    $disableBlocks = is_array($cons) ? ($cons['disable_blocks'] ?? []) : [];
+                    if (!is_array($disableBlocks)) {
+                        $disableBlocks = [];
+                    }
+                    $labelsDisable = [
+                        'time_series' => 'Série temporal',
+                        'forecast' => 'Forecast',
+                        'finance' => 'Financeiro',
+                        'gantt' => 'Gantt',
+                    ];
+                    foreach ($labelsDisable as $k => $lbl) {
+                        if (!empty($disableBlocks[$k])) {
+                            $disabled[] = $lbl;
+                        }
+                    }
+                    $cg = is_array($cons) ? ($cons['confidence_global'] ?? null) : null;
+                ?>
+
+                <?php if (!empty($disabled) || !empty($mode['force_conservative']) || $cg !== null): ?>
+                    <div style="margin:-4px 0 12px 0;border:1px solid #fed7aa;background:#fff7ed;border-radius:12px;padding:10px 12px;color:#7c2d12;font-size:13px;max-width:980px;">
+                        <?php if ($cg !== null): ?>
+                            <div><strong>Confiança global:</strong> <?= htmlspecialchars($fmtPct((float)$cg)) ?></div>
+                        <?php endif; ?>
+                        <?php if (!empty($mode['force_conservative'])): ?>
+                            <div><strong>Modo conservador:</strong> ativado</div>
+                        <?php endif; ?>
+                        <?php if (!empty($disabled)): ?>
+                            <div><strong>Blocos omitidos:</strong> <?= htmlspecialchars(implode(', ', $disabled)) ?></div>
+                        <?php endif; ?>
+                    </div>
+                <?php endif; ?>
+
+                <div style="display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;">
+                    <div style="border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;">
+                        <div style="font-weight:600;margin-bottom:6px;">Colunas selecionadas</div>
+                        <div style="font-size:13px;color:#111827;">
+                            <div><strong>Valor:</strong> <?= htmlspecialchars((string)($sel['amount']['column'] ?? '')) ?> <span style="color:#64748b;">(conf <?= htmlspecialchars((string)($sel['amount']['confidence'] ?? '0')) ?>)</span></div>
+                            <div><strong>Data:</strong> <?= htmlspecialchars((string)($sel['date']['column'] ?? '')) ?> <span style="color:#64748b;">(conf <?= htmlspecialchars((string)($sel['date']['confidence'] ?? '0')) ?>)</span></div>
+                            <div><strong>Categoria:</strong> <?= htmlspecialchars((string)($sel['category']['column'] ?? '')) ?> <span style="color:#64748b;">(conf <?= htmlspecialchars((string)($sel['category']['confidence'] ?? '0')) ?>)</span></div>
+                        </div>
+                    </div>
+
+                    <div style="border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;">
+                        <div style="font-weight:600;margin-bottom:6px;">Checagens (amostra)</div>
+                        <div style="font-size:13px;color:#111827;">
+                            <?php if (!empty($checks['amount_quality'])): ?>
+                                <div><strong>Valor</strong>: completude <?= htmlspecialchars($fmtPct($checks['amount_quality']['completeness'] ?? 0)) ?>; válido <?= htmlspecialchars($fmtPct($checks['amount_quality']['valid_ratio'] ?? 0)) ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($checks['date_quality'])): ?>
+                                <div><strong>Data</strong>: completude <?= htmlspecialchars($fmtPct($checks['date_quality']['completeness'] ?? 0)) ?>; válido <?= htmlspecialchars($fmtPct($checks['date_quality']['valid_ratio'] ?? 0)) ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($checks['category_quality'])): ?>
+                                <div><strong>Categoria</strong>: completude <?= htmlspecialchars($fmtPct($checks['category_quality']['completeness'] ?? 0)) ?></div>
+                            <?php endif; ?>
+                            <?php if (!empty($dq) && (isset($dq['quality_score']) || isset($dq['structure']))): ?>
+                                <?php
+                                    $qs = $dq['quality_score'] ?? null;
+                                    $st = $dq['structure'] ?? [];
+                                ?>
+                                <div style="margin-top:6px;"><strong>Dataset</strong>: qualidade <?= htmlspecialchars($fmtPct((float)$qs)) ?><?php if (!empty($st) && isset($st['row_width_consistency'])): ?>; consistência estrutural <?= htmlspecialchars($fmtPct((float)$st['row_width_consistency'])) ?><?php endif; ?></div>
+                            <?php endif; ?>
+                            <?php if (empty($checks)): ?>
+                                <div style="color:#64748b;">Sem checagens disponíveis (amostra vazia).</div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+
+                    <div style="border:1px solid #e5e7eb;border-radius:12px;padding:10px 12px;">
+                        <div style="font-weight:600;margin-bottom:6px;">Modo e estado</div>
+                        <div style="font-size:13px;color:#111827;">
+                            <div><strong>Conservador:</strong> <?= !empty($mode['force_conservative']) ? 'Sim' : 'Não' ?></div>
+                            <div><strong>Desambiguação:</strong> <?= !empty($clar['needs_clarification']) ? 'Necessária' : 'Não' ?></div>
+                            <?php if (!empty($clar['question_ids']) && is_array($clar['question_ids'])): ?>
+                                <div style="color:#64748b;"><strong>Perguntas:</strong> <?= htmlspecialchars(implode(', ', $clar['question_ids'])) ?></div>
+                            <?php endif; ?>
+                        </div>
+                    </div>
+                </div>
+
+                <div style="margin-top:12px;">
+                    <details>
+                        <summary style="cursor:pointer;font-size:13px;color:#2563eb;">Ver detalhes (JSON)</summary>
+                        <pre style="white-space:pre-wrap;font-size:12px;background:#111827;color:#e5e7eb;border-radius:10px;padding:10px 12px;max-width:100%;overflow:auto;">
+<?= htmlspecialchars(json_encode($decisionLog, JSON_PRETTY_PRINT | JSON_UNESCAPED_UNICODE)) ?>
+                        </pre>
+                    </details>
+                </div>
+            </section>
+        <?php endif; ?>
+
         <section class="card-large">
             <div class="card-header">
                 <div>
