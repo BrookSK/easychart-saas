@@ -119,6 +119,67 @@ class AnalysisEngine
         $analyticPlan['validation'] = $planValidation;
         $requestPlan['analytic_plan'] = $analyticPlan;
 
+        $planSig = self::planSignature($analyticPlan);
+        $requestHash = md5(mb_strtolower(trim((string)($requestPlan['raw'] ?? ''))));
+        $requestPlan['plan_signature'] = $planSig;
+        $requestPlan['request_hash'] = $requestHash;
+
+        $prevRequestHash = null;
+        $prevPlanSig = null;
+        if (!empty($overrides) && is_array($overrides)) {
+            $prevRequestHash = isset($overrides['__last_request_hash']) ? trim((string)$overrides['__last_request_hash']) : null;
+            $prevPlanSig = isset($overrides['__last_plan_sig']) ? trim((string)$overrides['__last_plan_sig']) : null;
+        }
+        if ($prevRequestHash && $prevPlanSig && $prevRequestHash !== $requestHash && $prevPlanSig === $planSig) {
+            return [
+                'needs_clarification' => true,
+                'questions' => [
+                    [
+                        'id' => 'plan_intent_clarify',
+                        'type' => 'select',
+                        'label' => 'Sua pergunta mudou, mas o plano analítico ficou igual. Qual é o objetivo principal desta análise?',
+                        'why' => 'Isso evita reutilizar um pipeline padrão e garante que a análise responda exatamente sua pergunta.',
+                        'options' => ['count', 'sum', 'avg'],
+                        'default' => $analyticPlan['metric_op'] ?? null,
+                    ],
+                ],
+                'decision_log' => array_merge((array)$decisionLog, [
+                    'anti_recycle' => [
+                        'triggered' => true,
+                        'prev_request_hash' => $prevRequestHash,
+                        'prev_plan_sig' => $prevPlanSig,
+                        'current_request_hash' => $requestHash,
+                        'current_plan_sig' => $planSig,
+                    ],
+                ]),
+                'dataset_profile' => $profile,
+                'inferred_context' => $context,
+                'column_map' => $columnMap,
+                'request_plan' => $requestPlan,
+                'analytic_plan' => $analyticPlan,
+                'dashboard_plan' => null,
+                'analytics' => null,
+                'charts' => [],
+                'report_text' => null,
+                'report_html' => null,
+                'stages' => [
+                    'clarification' => [
+                        'title' => 'Desambiguação (necessária)',
+                        'questions' => [
+                            [
+                                'id' => 'plan_intent_clarify',
+                                'type' => 'select',
+                                'label' => 'Sua pergunta mudou, mas o plano analítico ficou igual. Qual é o objetivo principal desta análise?',
+                                'why' => 'Isso evita reutilizar um pipeline padrão e garante que a análise responda exatamente sua pergunta.',
+                                'options' => ['count', 'sum', 'avg'],
+                                'default' => $analyticPlan['metric_op'] ?? null,
+                            ],
+                        ],
+                    ],
+                ],
+            ];
+        }
+
         // Fallback automático: se group_by tiver cardinalidade alta demais, degradamos o plano.
         $issues = $planValidation['issues'] ?? [];
         if (is_array($issues)) {
@@ -180,7 +241,8 @@ class AnalysisEngine
         $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
 
         // Refino por gráfico via IA (1 chamada por gráfico) + limite de 6 gráficos
-        $charts = array_slice($charts, 0, 6);
+        $maxCharts = !empty($requestPlan['wants_dashboard']) ? 6 : 3;
+        $charts = array_slice($charts, 0, $maxCharts);
         if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
             $charts = self::aiRefineCharts($charts, $cleanHeaders, $typed, $profile, $context, $requestPlan, $llmConfig);
         }
@@ -241,6 +303,13 @@ class AnalysisEngine
         $forceConservative = (bool)($overrides['force_conservative'] ?? false);
         if (!empty($overrides['skip_clarification'])) {
             $forceConservative = true;
+        }
+
+        if (!empty($overrides['plan_intent_clarify'])) {
+            $v = trim((string)$overrides['plan_intent_clarify']);
+            if (in_array($v, ['count', 'sum', 'avg'], true)) {
+                $requestPlan['agg'] = $v;
+            }
         }
 
         $resolveHeader = function($v) use ($headers): ?string {
@@ -1050,30 +1119,21 @@ class AnalysisEngine
         }
 
         $metricOp = $requestPlan['agg'] ?? null;
-        if (!is_string($metricOp) || $metricOp === '') {
-            $metricOp = 'sum';
-        }
-        if (!in_array($metricOp, ['sum', 'avg', 'count'], true)) {
-            $metricOp = 'sum';
+        if (!is_string($metricOp) || !in_array($metricOp, ['sum', 'avg', 'count'], true)) {
+            $metricOp = null;
         }
 
-        $groupBy = $requestPlan['entity'] ?? ($context['main_entity'] ?? null);
+        $groupBy = $requestPlan['entity'] ?? null;
         if (!is_string($groupBy) || $groupBy === '') {
             $groupBy = null;
         }
 
-        $metricColumn = $requestPlan['metric'] ?? ($context['main_metric'] ?? null);
+        $metricColumn = $requestPlan['metric'] ?? null;
         if (!is_string($metricColumn) || $metricColumn === '') {
-            $metricColumn = $columnMap['amount']['column'] ?? null;
-        }
-        if (!is_string($metricColumn) || $metricColumn === '') {
-            $metricColumn = null;
-        }
-        if ($metricOp === 'count') {
             $metricColumn = null;
         }
 
-        $timeAxis = $requestPlan['time_axis'] ?? ($context['time_axis'] ?? null);
+        $timeAxis = $requestPlan['time_axis'] ?? null;
         if (!is_string($timeAxis) || $timeAxis === '') {
             $timeAxis = null;
         }
@@ -1101,6 +1161,63 @@ class AnalysisEngine
             }
         }
 
+        $reqLower = mb_strtolower((string)($requestPlan['raw'] ?? ''));
+        $wantsCount = (bool)preg_match('/\b(quantos|quantas|qtd|contagem|count|frequ[êe]ncia|vezes|repetid)\b/u', $reqLower);
+        $wantsValue = (bool)preg_match('/\b(quanto|total|soma|sum|gastei|gasto|despesa|cust[oa]|receita|valor)\b/u', $reqLower);
+        $wantsAvg = (bool)preg_match('/\b(m[ée]dia|average|avg)\b/u', $reqLower);
+
+        if ($metricOp === null) {
+            if ($wantsAvg) {
+                $metricOp = 'avg';
+            } elseif ($wantsCount) {
+                $metricOp = 'count';
+            } elseif ($wantsValue) {
+                $metricOp = 'sum';
+            } else {
+                $metricOp = 'count';
+            }
+        }
+
+        if ($metricOp === 'count') {
+            $metricColumn = null;
+        } else {
+            if ($metricColumn === null) {
+                $metricColumn = $columnMap['amount']['column'] ?? null;
+                if (!is_string($metricColumn) || $metricColumn === '') {
+                    $metricColumn = $context['main_metric'] ?? null;
+                }
+                if (!is_string($metricColumn) || $metricColumn === '') {
+                    $metricColumn = null;
+                }
+            }
+        }
+
+        if ($groupBy === null) {
+            $needsEntity = in_array('comparison', $intents, true) || in_array('share', $intents, true) || $wantsCount || (bool)preg_match('/\b(quem|quais|qual)\b/u', $reqLower);
+            if ($needsEntity) {
+                $groupBy = $columnMap['category']['column'] ?? null;
+                if (!is_string($groupBy) || $groupBy === '') {
+                    $groupBy = $context['main_entity'] ?? null;
+                }
+                if (!is_string($groupBy) || $groupBy === '') {
+                    $groupBy = null;
+                }
+            }
+        }
+
+        if ($timeAxis === null) {
+            $needsTime = in_array('time_series', $intents, true);
+            if ($needsTime) {
+                $timeAxis = $columnMap['date']['column'] ?? null;
+                if (!is_string($timeAxis) || $timeAxis === '') {
+                    $timeAxis = $context['time_axis'] ?? null;
+                }
+                if (!is_string($timeAxis) || $timeAxis === '') {
+                    $timeAxis = null;
+                }
+            }
+        }
+
         return [
             'group_by' => $groupBy,
             'metric_op' => $metricOp,
@@ -1110,6 +1227,20 @@ class AnalysisEngine
             'order' => $order,
             'limit' => $limit,
         ];
+    }
+
+    private static function planSignature(array $analyticPlan): string
+    {
+        $sig = [
+            'group_by' => $analyticPlan['group_by'] ?? null,
+            'metric_op' => $analyticPlan['metric_op'] ?? null,
+            'metric_column' => $analyticPlan['metric_column'] ?? null,
+            'time_axis' => $analyticPlan['time_axis'] ?? null,
+            'time_bucket' => $analyticPlan['time_bucket'] ?? null,
+            'order' => $analyticPlan['order'] ?? null,
+            'limit' => $analyticPlan['limit'] ?? null,
+        ];
+        return md5(json_encode($sig, JSON_UNESCAPED_UNICODE));
     }
 
     private static function validateAnalyticPlan(array $analyticPlan, array $profile): array
@@ -1701,6 +1832,7 @@ class AnalysisEngine
 
         $intents = [];
         $wantsDetail = (bool)preg_match('/\b(detalh|detalhar|detalhando|dentro\s+de\s+cada|por\s+categoria\s+e\s+sub|subcategoria|sub\s*categoria|itens|lan[cç]amentos)\b/u', $reqLower);
+        $wantsDashboard = (bool)preg_match('/\b(dashboard|painel|overview|vis[aã]o\s+geral|resumo\s+geral|relat[óo]rio\s+completo)\b/u', $reqLower);
         // contexto financeiro (gastos/despesas) costuma pedir comparação e participação
         $mentionsSpend = (bool)preg_match('/\b(gasto|gastos|despesa|despesas|custo|custos|pagamento|pagar|sa[ií]da|saidas)\b/u', $reqLower);
         if (preg_match('/\b(tend[êe]ncia|evolu[cç][aã]o|ao longo|over time|time series|s[ée]rie temporal|timeline|mensal|di[aá]rio|semanal|por dia|por m[êe]s|por ano)\b/u', $reqLower)) {
@@ -1763,14 +1895,18 @@ class AnalysisEngine
             }
         }
 
-        // fallback: usa mapa canônico quando o prompt não cita colunas explicitamente
-        if ($metric === null && !empty($columnMap['amount']['column'])) {
+        $wantsCount = (bool)preg_match('/\b(quantos|quantas|qtd|contagem|count|frequ[êe]ncia|vezes|repetid)\b/u', $reqLower);
+        $wantsValue = (bool)preg_match('/\b(quanto|total|soma|sum|gastei|gasto|despesa|cust[oa]|receita|valor)\b/u', $reqLower);
+        $wantsTime = in_array('time_series', $intents, true);
+        $needsEntity = in_array('comparison', $intents, true) || in_array('share', $intents, true) || $wantsCount || (bool)preg_match('/\b(quem|quais|qual)\b/u', $reqLower);
+
+        if ($metric === null && $wantsValue && !empty($columnMap['amount']['column'])) {
             $metric = $columnMap['amount']['column'];
         }
-        if ($entity === null && !empty($columnMap['category']['column'])) {
+        if ($entity === null && $needsEntity && !empty($columnMap['category']['column'])) {
             $entity = $columnMap['category']['column'];
         }
-        if ($timeAxis === null && !empty($columnMap['date']['column'])) {
+        if ($timeAxis === null && $wantsTime && !empty($columnMap['date']['column'])) {
             $timeAxis = $columnMap['date']['column'];
         }
 
@@ -1788,16 +1924,17 @@ class AnalysisEngine
         $agg = null;
         if (preg_match('/\b(m[ée]dia|average|avg)\b/u', $reqLower)) {
             $agg = 'avg';
-        } elseif (preg_match('/\b(soma|sum|total)\b/u', $reqLower)) {
-            $agg = 'sum';
-        } elseif (preg_match('/\b(contagem|count|quantidade|qtd)\b/u', $reqLower)) {
+        } elseif (preg_match('/\b(quantos|quantas|qtd|contagem|count|frequ[êe]ncia|vezes|repetid)\b/u', $reqLower)) {
             $agg = 'count';
+        } elseif (preg_match('/\b(soma|sum|total|quanto|gastei|gasto|despesa|cust[oa]|receita|valor)\b/u', $reqLower)) {
+            $agg = 'sum';
         }
 
         return [
             'intents' => $intents,
             'raw' => $req,
             'wants_detail' => $wantsDetail,
+            'wants_dashboard' => $wantsDashboard,
             'metric' => $metric,
             'entity' => $entity,
             'time_axis' => $timeAxis,

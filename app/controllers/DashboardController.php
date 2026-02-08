@@ -38,6 +38,13 @@ class DashboardController
             if (isset($_POST['overrides']) && is_array($_POST['overrides'])) {
                 $overrides = $_POST['overrides'];
             }
+
+            if (empty($overrides['__last_request_hash']) && !empty($_SESSION['analysis_last_request_hash'])) {
+                $overrides['__last_request_hash'] = (string)$_SESSION['analysis_last_request_hash'];
+            }
+            if (empty($overrides['__last_plan_sig']) && !empty($_SESSION['analysis_last_plan_sig'])) {
+                $overrides['__last_plan_sig'] = (string)$_SESSION['analysis_last_plan_sig'];
+            }
             $skipClarification = !empty($_POST['skip_clarification']);
             if ($skipClarification) {
                 $overrides['skip_clarification'] = true;
@@ -139,6 +146,18 @@ class DashboardController
                             $needsClarification = !empty($result['needs_clarification']);
                             if ($needsClarification) {
                                 $clarificationQuestions = $result['questions'] ?? [];
+                            }
+
+                            if (!$needsClarification) {
+                                $rp = $result['request_plan'] ?? null;
+                                if (is_array($rp)) {
+                                    if (!empty($rp['request_hash'])) {
+                                        $_SESSION['analysis_last_request_hash'] = (string)$rp['request_hash'];
+                                    }
+                                    if (!empty($rp['plan_signature'])) {
+                                        $_SESSION['analysis_last_plan_sig'] = (string)$rp['plan_signature'];
+                                    }
+                                }
                             }
 
                             $chartsList = $result['charts'] ?? [];
