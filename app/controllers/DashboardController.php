@@ -4,6 +4,7 @@ require_once __DIR__ . '/../config/config.php';
 require_once __DIR__ . '/../core/Database.php';
 require_once __DIR__ . '/../helpers/DataIngestionHelper.php';
 require_once __DIR__ . '/../helpers/AnalysisEngine.php';
+require_once __DIR__ . '/../helpers/OpenAIClient.php';
 
 class DashboardController
 {
@@ -113,7 +114,25 @@ class DashboardController
                                 // Se a tabela não existir ainda, seguimos sem aprendizado.
                             }
 
-                            $result = AnalysisEngine::run($ing['table'], $prompt, $overrides);
+                            $openAiKey = '';
+                            try {
+                                $kStmt = $pdo->prepare("SELECT api_key FROM api_configs WHERE user_id = :uid AND provider = 'openai' LIMIT 1");
+                                $kStmt->execute(['uid' => (int)$user['id']]);
+                                $kRow = $kStmt->fetch();
+                                if ($kRow && !empty($kRow['api_key'])) {
+                                    $openAiKey = (string)$kRow['api_key'];
+                                }
+                            } catch (PDOException $e) {
+                                $openAiKey = '';
+                            }
+
+                            $llmConfig = [
+                                'provider' => 'openai',
+                                'api_key' => $openAiKey,
+                                'model' => 'gpt-4o-mini',
+                            ];
+
+                            $result = AnalysisEngine::run($ing['table'], $prompt, $overrides, $llmConfig);
 
                             $decisionLog = $result['decision_log'] ?? null;
 
@@ -227,6 +246,9 @@ class DashboardController
                                     $chartsData[] = [
                                         'type'   => $renderType,
                                         'title'  => $chartConfig['title'] ?? 'Generated chart',
+                                        'description' => $chartConfig['description'] ?? null,
+                                        'insight' => $chartConfig['insight'] ?? null,
+                                        'caveat' => $chartConfig['caveat'] ?? null,
                                         'labels' => $labels,
                                         'values' => $values,
                                     ];

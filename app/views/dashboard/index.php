@@ -539,7 +539,16 @@
                     <div class="card-header">
                         <div>
                             <div class="card-title"><?= htmlspecialchars($chart['title'] ?? 'Generated chart') ?></div>
-                            <div class="card-subtitle">Visualization based on your file and AI suggestions.</div>
+                            <?php if (!empty($chart['insight'])): ?>
+                                <div class="card-subtitle"><?= htmlspecialchars((string)$chart['insight']) ?></div>
+                            <?php elseif (!empty($chart['description'])): ?>
+                                <div class="card-subtitle"><?= htmlspecialchars((string)$chart['description']) ?></div>
+                            <?php else: ?>
+                                <div class="card-subtitle">Visualization based on your file and AI suggestions.</div>
+                            <?php endif; ?>
+                            <?php if (!empty($chart['caveat'])): ?>
+                                <div style="font-size:12px;color:#7c2d12;margin-top:6px;"><?= htmlspecialchars((string)$chart['caveat']) ?></div>
+                            <?php endif; ?>
                         </div>
                     </div>
                     <div style="position:relative; height:300px; max-height:500px;">

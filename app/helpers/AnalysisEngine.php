@@ -1,8 +1,10 @@
 <?php
 
+require_once __DIR__ . '/OpenAIClient.php';
+
 class AnalysisEngine
 {
-    public static function run(array $table, ?string $userRequest = null, array $overrides = []): array
+    public static function run(array $table, ?string $userRequest = null, array $overrides = [], array $llmConfig = []): array
     {
         $headers = $table['headers'] ?? [];
         $rows = $table['rows'] ?? [];
@@ -16,6 +18,19 @@ class AnalysisEngine
         // ETAPA 1: Perfil do dataset + mapeamento canônico de colunas + leitura do prompt
         $typed = self::inferColumnTypes($cleanHeaders, $rows);
         $profile = self::buildDatasetProfile($cleanHeaders, $rows, $typed);
+
+        // Normalização assistida por IA (sempre ligada quando há api_key)
+        $normalization = null;
+        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
+            $normalization = self::aiProposeNormalization($cleanHeaders, $rows, $typed, $profile, $userRequest, $llmConfig);
+            if (!empty($normalization['plan']) && is_array($normalization['plan'])) {
+                $rows = self::applyNormalizationPlan($cleanHeaders, $rows, $normalization['plan'], $normalization);
+                // Recalcula após normalização
+                $typed = self::inferColumnTypes($cleanHeaders, $rows);
+                $profile = self::buildDatasetProfile($cleanHeaders, $rows, $typed);
+            }
+        }
+
         $columnMap = self::mapColumns($cleanHeaders, $typed, $profile);
         $requestPlan = self::interpretUserRequest($cleanHeaders, $typed, $profile, $userRequest, $columnMap);
         $context = self::inferContext($cleanHeaders, $typed, $profile, $requestPlan, $columnMap);
@@ -142,6 +157,12 @@ class AnalysisEngine
         // ETAPA 3: Criação dos gráficos específicos (apenas o que faz sentido para a solicitação)
         $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
 
+        // Refino por gráfico via IA (1 chamada por gráfico) + limite de 6 gráficos
+        $charts = array_slice($charts, 0, 6);
+        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
+            $charts = self::aiRefineCharts($charts, $cleanHeaders, $typed, $profile, $context, $requestPlan, $llmConfig);
+        }
+
         // ETAPA 4: Relatório final (formatado / "bonito")
         $reportHtml = self::buildReportHtml($profile, $context, $analytics, $charts, $dashboardPlan, $userRequest);
         $reportText = self::buildReport($profile, $context, $analytics, $charts);
@@ -160,6 +181,7 @@ class AnalysisEngine
             'charts' => $charts,
             'report_text' => $reportText,
             'report_html' => $reportHtml,
+            'normalization' => $normalization,
             'stages' => [
                 '1' => [
                     'title' => 'Análise do arquivo e alinhamento do objetivo',
@@ -2197,7 +2219,97 @@ class AnalysisEngine
     {
         $charts = [];
 
-        $push = function(array $chart) use (&$charts): void {
+        $seen = [];
+
+        $isAllSame = function(array $values): bool {
+            if (empty($values)) {
+                return true;
+            }
+            $min = null;
+            $max = null;
+            foreach ($values as $v) {
+                $vv = (float)$v;
+                $min = $min === null ? $vv : min($min, $vv);
+                $max = $max === null ? $vv : max($max, $vv);
+            }
+            if ($min === null || $max === null) {
+                return true;
+            }
+            return abs($max - $min) < 1e-9;
+        };
+
+        $nonZeroCount = function(array $values): int {
+            $c = 0;
+            foreach ($values as $v) {
+                if (abs((float)$v) > 0) {
+                    $c++;
+                }
+            }
+            return $c;
+        };
+
+        $push = function(array $chart) use (&$charts, &$seen, $isAllSame, $nonZeroCount): void {
+            $type = (string)($chart['chart_type'] ?? '');
+            $labels = $chart['labels'] ?? [];
+            $values = $chart['values'] ?? [];
+            if (!is_array($labels) || !is_array($values) || empty($labels) || empty($values)) {
+                return;
+            }
+            if (count($labels) !== count($values)) {
+                return;
+            }
+
+            $sum = 0.0;
+            $max = null;
+            $min = null;
+            foreach ($values as $v) {
+                $vv = (float)$v;
+                $sum += $vv;
+                $max = $max === null ? $vv : max($max, $vv);
+                $min = $min === null ? $vv : min($min, $vv);
+            }
+
+            if ($nonZeroCount($values) <= 0) {
+                return;
+            }
+
+            if ($type === 'pie') {
+                if (count($labels) < 2) {
+                    return;
+                }
+                $absSum = 0.0;
+                $absMax = null;
+                foreach ($values as $v) {
+                    $vv = abs((float)$v);
+                    $absSum += $vv;
+                    $absMax = $absMax === null ? $vv : max($absMax, $vv);
+                }
+                $share = $absSum > 0 ? ((float)$absMax / (float)$absSum) : 1.0;
+                if ($share >= 0.95) {
+                    return;
+                }
+            }
+
+            if (in_array($type, ['bar', 'line', 'radar', 'boxplot', 'gantt'], true)) {
+                if ($isAllSame($values)) {
+                    return;
+                }
+            }
+
+            if ($type === 'bar') {
+                $t = (string)($chart['title'] ?? '');
+                if (stripos($t, 'Distribuição:') === 0) {
+                    if ($nonZeroCount($values) <= 1) {
+                        return;
+                    }
+                }
+            }
+
+            $key = md5($type . '|' . (string)($chart['title'] ?? '') . '|' . json_encode(array_slice($labels, 0, 30), JSON_UNESCAPED_UNICODE));
+            if (!empty($seen[$key])) {
+                return;
+            }
+            $seen[$key] = true;
             $charts[] = $chart;
         };
 
@@ -2303,13 +2415,13 @@ class AnalysisEngine
                 continue;
             }
             if (!empty($stats['histogram']['bins']) && !empty($stats['histogram']['counts'])) {
-                $charts[] = [
+                $push([
                     'chart_type' => 'bar',
                     'title' => 'Distribuição: ' . $col,
                     'description' => 'Histograma baseado em bins.',
                     'labels' => $stats['histogram']['bins'],
                     'values' => $stats['histogram']['counts'],
-                ];
+                ]);
             }
 
             // Boxplot best-effort (Chart.js padrão não tem boxplot nativo sem plugin)
@@ -2318,7 +2430,7 @@ class AnalysisEngine
                 if ($iqr <= 0) {
                     continue;
                 }
-                $charts[] = [
+                $push([
                     'chart_type' => 'boxplot',
                     'title' => 'Boxplot (5 números): ' . $col,
                     'description' => 'Resumo de 5 números (min, Q1, mediana, Q3, max) para variabilidade e consistência.',
@@ -2330,7 +2442,7 @@ class AnalysisEngine
                         (float)$stats['q3'],
                         (float)$stats['max'],
                     ],
-                ];
+                ]);
             }
         }
 
@@ -2352,13 +2464,13 @@ class AnalysisEngine
             $values = array_values($top);
 
             if ($wantDistribution) {
-                $charts[] = [
+                $push([
                     'chart_type' => 'bar',
                     'title' => 'Top categorias: ' . $col,
                     'description' => 'Ranking por contagem (top 20).',
                     'labels' => $labels,
                     'values' => $values,
-                ];
+                ]);
             }
 
             // Pizza: apenas quando participação faz sentido (poucas categorias e concentração relevante)
@@ -2371,13 +2483,13 @@ class AnalysisEngine
                     foreach ($values as $v) {
                         $pct[] = round(($v / $total) * 100, 2);
                     }
-                    $charts[] = [
+                    $push([
                         'chart_type' => 'pie',
                         'title' => 'Participação: ' . $col,
                         'description' => 'Participação percentual das categorias (top).',
                         'labels' => $labels,
                         'values' => $pct,
-                    ];
+                    ]);
                 }
             }
         }
@@ -3347,6 +3459,399 @@ class AnalysisEngine
     private static function meaningFromChart(array $c): string
     {
         $type = $c['chart_type'] ?? '';
+        if ($type === 'pie') {
+            return 'Indica concentração/distribuição percentual entre categorias.';
+        }
+        if ($type === 'bar') {
+            return 'Permite comparação direta e ranking entre categorias/intervalos.';
+        }
+        if ($type === 'line') {
+            return 'Evidencia tendência temporal, variações e pontos de pico/queda.';
+        }
+        if ($type === 'radar') {
+            return 'Compara múltiplas métricas simultaneamente em um perfil relativo.';
+        }
+        if ($type === 'boxplot') {
+            return 'Resume variabilidade e consistência via min/Q1/mediana/Q3/max (best-effort).';
+        }
+        if ($type === 'gantt') {
+            return 'Representa duração por item (best-effort), útil para análise de fases/etapas com início/fim.';
+        }
+        return 'Visualização comparativa.';
+    }
+
+    private static function aiProposeNormalization(array $headers, array $rows, array $types, array $profile, ?string $userRequest, array $llmConfig): array
+    {
+        $sample = array_slice($rows, 0, 80);
+        $colProfiles = $profile['columns'] ?? [];
+        if (!is_array($colProfiles)) {
+            $colProfiles = [];
+        }
+
+        $sys = "Você é um analista de dados especializado em normalização de planilhas.\n" .
+            "Retorne APENAS JSON válido. Não inclua texto fora do JSON.\n" .
+            "Objetivo: propor regras conservadoras para normalizar números/moedas, datas e categorias (aliases) para melhorar parsing e consistência.\n" .
+            "Não invente dados. Se não tiver confiança, não proponha regra para a coluna.";
+
+        $user = [
+            'user_request' => (string)($userRequest ?? ''),
+            'headers' => $headers,
+            'types_initial' => $types,
+            'profile_columns' => $colProfiles,
+            'sample_rows' => $sample,
+            'output_schema' => [
+                'version' => '1',
+                'columns' => [
+                    [
+                        'name' => 'NomeDaColuna',
+                        'kind' => 'number|date|category|ignore',
+                        'confidence' => 0.0,
+                        'number' => [
+                            'decimal_sep' => ',|.|',
+                            'thousand_sep' => '.|,|space|',
+                            'currency_symbols' => ['R$', '$', '€'],
+                            'negative_parens' => true,
+                        ],
+                        'date' => [
+                            'formats' => ['d/m/Y', 'Y-m-d', 'd-m-Y', 'm/Y'],
+                        ],
+                        'category' => [
+                            'aliases' => [
+                                ['from' => 'pgto', 'to' => 'pagamento']
+                            ]
+                        ]
+                    ]
+                ]
+            ]
+        ];
+
+        $model = (string)($llmConfig['model'] ?? 'gpt-4o-mini');
+        $resp = OpenAIClient::jsonCall((string)$llmConfig['api_key'], $model, $sys, json_encode($user, JSON_UNESCAPED_UNICODE), 0.1);
+        if (empty($resp['ok']) || !is_array($resp['data'])) {
+            return ['ok' => false, 'error' => $resp['error'] ?? 'normalization_failed', 'plan' => null];
+        }
+
+        $plan = $resp['data'];
+        if (!is_array($plan)) {
+            return ['ok' => false, 'error' => 'normalization_invalid', 'plan' => null];
+        }
+
+        return ['ok' => true, 'error' => null, 'plan' => $plan, 'applied' => [], 'metrics' => []];
+    }
+
+    private static function applyNormalizationPlan(array $headers, array $rows, array $plan, array &$normalizationLog): array
+    {
+        $cols = $plan['columns'] ?? [];
+        if (!is_array($cols)) {
+            return $rows;
+        }
+
+        $byName = [];
+        foreach ($cols as $c) {
+            if (!is_array($c)) {
+                continue;
+            }
+            $name = (string)($c['name'] ?? '');
+            if ($name === '') {
+                continue;
+            }
+            $byName[$name] = $c;
+        }
+
+        $idxRules = [];
+        foreach ($headers as $i => $h) {
+            if (!is_string($h) || $h === '') {
+                continue;
+            }
+            if (!empty($byName[$h]) && is_array($byName[$h])) {
+                $idxRules[(int)$i] = $byName[$h];
+            }
+        }
+
+        $aliasesByIdx = [];
+        foreach ($idxRules as $i => $r) {
+            $kind = (string)($r['kind'] ?? '');
+            if ($kind !== 'category') {
+                continue;
+            }
+            $aliases = $r['category']['aliases'] ?? [];
+            if (!is_array($aliases) || empty($aliases)) {
+                continue;
+            }
+            $map = [];
+            foreach ($aliases as $a) {
+                if (!is_array($a)) {
+                    continue;
+                }
+                $from = strtolower(trim((string)($a['from'] ?? '')));
+                $to = trim((string)($a['to'] ?? ''));
+                if ($from !== '' && $to !== '') {
+                    $map[$from] = $to;
+                }
+            }
+            if (!empty($map)) {
+                $aliasesByIdx[(int)$i] = $map;
+            }
+        }
+
+        $numRuleByIdx = [];
+        foreach ($idxRules as $i => $r) {
+            $kind = (string)($r['kind'] ?? '');
+            if ($kind !== 'number') {
+                continue;
+            }
+            $nr = $r['number'] ?? [];
+            if (!is_array($nr)) {
+                $nr = [];
+            }
+            $numRuleByIdx[(int)$i] = $nr;
+        }
+
+        $dateRuleByIdx = [];
+        foreach ($idxRules as $i => $r) {
+            $kind = (string)($r['kind'] ?? '');
+            if ($kind !== 'date') {
+                continue;
+            }
+            $dr = $r['date'] ?? [];
+            if (!is_array($dr)) {
+                $dr = [];
+            }
+            $formats = $dr['formats'] ?? [];
+            if (!is_array($formats)) {
+                $formats = [];
+            }
+            $formats = array_values(array_filter(array_map(fn($x) => trim((string)$x), $formats), fn($x) => $x !== ''));
+            if (!empty($formats)) {
+                $dateRuleByIdx[(int)$i] = ['formats' => $formats];
+            }
+        }
+
+        $dateParseRatio = function(int $colIdx, array $rowsIn) : float {
+            $n = 0;
+            $ok = 0;
+            $max = min(400, count($rowsIn));
+            for ($i = 0; $i < $max; $i++) {
+                $row = $rowsIn[$i] ?? null;
+                if (!is_array($row)) {
+                    continue;
+                }
+                $s = isset($row[$colIdx]) ? trim((string)$row[$colIdx]) : '';
+                if ($s === '') {
+                    continue;
+                }
+                $n++;
+                if (self::parseDate($s) !== null) {
+                    $ok++;
+                }
+            }
+            if ($n <= 0) {
+                return 0.0;
+            }
+            return (float)$ok / (float)$n;
+        };
+
+        $normalizeNumber = function(string $s, array $nr): string {
+            $s = trim($s);
+            if ($s === '') {
+                return '';
+            }
+            $currency = $nr['currency_symbols'] ?? [];
+            if (is_array($currency)) {
+                foreach ($currency as $sym) {
+                    $sym = (string)$sym;
+                    if ($sym !== '') {
+                        $s = str_replace($sym, '', $s);
+                    }
+                }
+            }
+            $s = str_replace(["\u{00A0}", "\t"], ' ', $s);
+            $s = trim($s);
+
+            $negParens = !empty($nr['negative_parens']);
+            $isNeg = false;
+            if ($negParens && preg_match('/^\((.*)\)$/', $s, $m)) {
+                $isNeg = true;
+                $s = trim((string)$m[1]);
+            }
+
+            $s = preg_replace('/[^0-9,\.\-\s]/u', '', $s);
+            $s = trim($s);
+
+            $dec = (string)($nr['decimal_sep'] ?? '');
+            $th = (string)($nr['thousand_sep'] ?? '');
+
+            if ($th === 'space') {
+                $s = str_replace(' ', '', $s);
+            } elseif ($th === '.' || $th === ',') {
+                $s = str_replace($th, '', $s);
+            }
+
+            if ($dec === ',') {
+                // vírgula decimal => ponto
+                // remove pontos restantes como milhar, se houver
+                $s = str_replace('.', '', $s);
+                $s = str_replace(',', '.', $s);
+            } elseif ($dec === '.') {
+                // ponto decimal => remove vírgulas como milhar
+                $s = str_replace(',', '', $s);
+            }
+
+            $s = trim($s);
+            if ($isNeg && $s !== '' && $s[0] !== '-') {
+                $s = '-' . $s;
+            }
+            return $s;
+        };
+
+        $parseDateWithFormats = function(string $s, array $formats): ?DateTime {
+            $s = trim($s);
+            if ($s === '') {
+                return null;
+            }
+            foreach ($formats as $f) {
+                $dt = DateTime::createFromFormat($f, $s);
+                if ($dt instanceof DateTime) {
+                    $errs = DateTime::getLastErrors();
+                    if (!is_array($errs) || ((int)($errs['warning_count'] ?? 0) === 0 && (int)($errs['error_count'] ?? 0) === 0)) {
+                        return $dt;
+                    }
+                }
+            }
+            return null;
+        };
+
+        $normalizeDate = function(string $s, array $dr) use ($parseDateWithFormats): string {
+            $formats = $dr['formats'] ?? [];
+            if (!is_array($formats) || empty($formats)) {
+                return $s;
+            }
+            $dt = $parseDateWithFormats($s, $formats);
+            if (!$dt) {
+                return $s;
+            }
+            return $dt->format('Y-m-d');
+        };
+
+        $metrics = [];
+        foreach ($dateRuleByIdx as $ci => $dr) {
+            $before = $dateParseRatio((int)$ci, $rows);
+            $metrics['date'][(int)$ci] = ['before_parse_ratio' => round($before, 3)];
+        }
+
+        $maxRows = min(4000, count($rows));
+        for ($ri = 0; $ri < $maxRows; $ri++) {
+            $row = $rows[$ri] ?? null;
+            if (!is_array($row)) {
+                continue;
+            }
+            foreach ($aliasesByIdx as $ci => $map) {
+                $v = isset($row[$ci]) ? trim((string)$row[$ci]) : '';
+                if ($v === '') {
+                    continue;
+                }
+                $k = strtolower($v);
+                if (isset($map[$k])) {
+                    $row[$ci] = $map[$k];
+                }
+            }
+            foreach ($numRuleByIdx as $ci => $nr) {
+                $v = isset($row[$ci]) ? (string)$row[$ci] : '';
+                if (trim($v) === '') {
+                    continue;
+                }
+                $row[$ci] = $normalizeNumber($v, $nr);
+            }
+            foreach ($dateRuleByIdx as $ci => $dr) {
+                $v = isset($row[$ci]) ? (string)$row[$ci] : '';
+                if (trim($v) === '') {
+                    continue;
+                }
+                $row[$ci] = $normalizeDate($v, $dr);
+            }
+            $rows[$ri] = $row;
+        }
+
+        foreach ($dateRuleByIdx as $ci => $dr) {
+            $after = $dateParseRatio((int)$ci, $rows);
+            if (!isset($metrics['date'][(int)$ci])) {
+                $metrics['date'][(int)$ci] = [];
+            }
+            $metrics['date'][(int)$ci]['after_parse_ratio'] = round($after, 3);
+        }
+
+        $normalizationLog['applied'] = [
+            'number_columns' => array_keys($numRuleByIdx),
+            'category_columns' => array_keys($aliasesByIdx),
+            'date_columns' => array_keys($dateRuleByIdx),
+            'rows_processed' => $maxRows,
+        ];
+
+        $normalizationLog['metrics'] = $metrics;
+
+        return $rows;
+    }
+
+    private static function aiRefineCharts(array $charts, array $headers, array $types, array $profile, array $context, array $requestPlan, array $llmConfig): array
+    {
+        $model = (string)($llmConfig['model'] ?? 'gpt-4o-mini');
+        $userRequest = (string)($requestPlan['raw'] ?? '');
+        $out = [];
+        foreach ($charts as $c) {
+            if (!is_array($c)) {
+                continue;
+            }
+            $labels = $c['labels'] ?? [];
+            $values = $c['values'] ?? [];
+            if (!is_array($labels) || !is_array($values) || empty($labels) || empty($values)) {
+                $out[] = $c;
+                continue;
+            }
+            $labelsSmall = array_slice($labels, 0, 12);
+            $valuesSmall = array_slice($values, 0, 12);
+
+            $sys = "Você é um consultor de negócios e analista de dados.\n" .
+                "Sua tarefa: melhorar título, descrição e um insight textual (1-2 frases) para um gráfico, alinhado ao pedido do usuário.\n" .
+                "Retorne APENAS JSON válido.";
+
+            $user = [
+                'user_request' => $userRequest,
+                'chart' => [
+                    'chart_type' => $c['chart_type'] ?? null,
+                    'title' => $c['title'] ?? null,
+                    'description' => $c['description'] ?? null,
+                    'labels_sample' => $labelsSmall,
+                    'values_sample' => $valuesSmall,
+                ],
+                'output_schema' => [
+                    'title' => 'string',
+                    'description' => 'string',
+                    'insight' => 'string',
+                    'caveat' => 'string'
+                ]
+            ];
+
+            $resp = OpenAIClient::jsonCall((string)$llmConfig['api_key'], $model, $sys, json_encode($user, JSON_UNESCAPED_UNICODE), 0.2);
+            if (!empty($resp['ok']) && is_array($resp['data'])) {
+                $d = $resp['data'];
+                if (!empty($d['title'])) {
+                    $c['title'] = (string)$d['title'];
+                }
+                if (!empty($d['description'])) {
+                    $c['description'] = (string)$d['description'];
+                }
+                if (!empty($d['insight'])) {
+                    $c['insight'] = (string)$d['insight'];
+                }
+                if (!empty($d['caveat'])) {
+                    $c['caveat'] = (string)$d['caveat'];
+                }
+            }
+            $out[] = $c;
+        }
+        return $out;
+    }
+}
         if ($type === 'pie') {
             return 'Indica concentração/distribuição percentual entre categorias.';
         }
