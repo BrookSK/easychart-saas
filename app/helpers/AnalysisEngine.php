@@ -3852,24 +3852,3 @@ class AnalysisEngine
         return $out;
     }
 }
-        if ($type === 'pie') {
-            return 'Indica concentração/distribuição percentual entre categorias.';
-        }
-        if ($type === 'bar') {
-            return 'Permite comparação direta e ranking entre categorias/intervalos.';
-        }
-        if ($type === 'line') {
-            return 'Evidencia tendência temporal, variações e pontos de pico/queda.';
-        }
-        if ($type === 'radar') {
-            return 'Compara múltiplas métricas simultaneamente em um perfil relativo.';
-        }
-        if ($type === 'boxplot') {
-            return 'Resume variabilidade e consistência via min/Q1/mediana/Q3/max (best-effort).';
-        }
-        if ($type === 'gantt') {
-            return 'Representa duração por item (best-effort), útil para análise de fases/etapas com início/fim.';
-        }
-        return 'Visualização comparativa.';
-    }
-}
