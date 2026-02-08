@@ -25,11 +25,21 @@ class DashboardController
         $chartsData = [];
         $analysisReportText = null;
         $analysisReportId = null;
+        $clarificationQuestions = [];
 
         // Trata envio do AI Chart Generator
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $prompt        = trim($_POST['prompt'] ?? '');
             $spreadsheetId = (int)($_POST['spreadsheet_id'] ?? 0);
+
+            $overrides = [];
+            if (isset($_POST['overrides']) && is_array($_POST['overrides'])) {
+                $overrides = $_POST['overrides'];
+            }
+            $skipClarification = !empty($_POST['skip_clarification']);
+            if ($skipClarification) {
+                $overrides['skip_clarification'] = true;
+            }
 
             // Upload opcional de novo arquivo direto pelo dashboard
             if (isset($_FILES['spreadsheet']) && $_FILES['spreadsheet']['error'] === UPLOAD_ERR_OK) {
@@ -86,7 +96,12 @@ class DashboardController
                             ];
                             $error = $aiPayload['error'];
                         } else {
-                            $result = AnalysisEngine::run($ing['table'], $prompt);
+                            $result = AnalysisEngine::run($ing['table'], $prompt, $overrides);
+
+                            $needsClarification = !empty($result['needs_clarification']);
+                            if ($needsClarification) {
+                                $clarificationQuestions = $result['questions'] ?? [];
+                            }
 
                             $chartsList = $result['charts'] ?? [];
                             $aiPayload = [
@@ -94,90 +109,101 @@ class DashboardController
                                 'charts' => $chartsList,
                                 'request_plan' => $result['request_plan'] ?? null,
                                 'inferred_context' => $result['inferred_context'] ?? null,
+                                'needs_clarification' => $result['needs_clarification'] ?? false,
+                                'questions' => $result['questions'] ?? [],
                             ];
 
-                            $analysisReportText = $result['report_text'] ?? null;
-                            $analysisReportHtml = $result['report_html'] ?? null;
-                            if (!empty($analysisReportHtml)) {
-                                $analysisReportText = $analysisReportHtml;
-                            }
+                            if ($needsClarification) {
+                                // Não persiste relatório/gráficos até desambiguar.
+                                $analysisReportText = null;
+                                $analysisReportId = null;
+                            } else {
 
-                            $datasetProfileToStore = $result['dataset_profile'] ?? null;
-                            if (is_array($datasetProfileToStore) && array_key_exists('sample_rows', $datasetProfileToStore)) {
-                                unset($datasetProfileToStore['sample_rows']);
-                            }
+                                $analysisReportText = $result['report_text'] ?? null;
+                                $analysisReportHtml = $result['report_html'] ?? null;
+                                if (!empty($analysisReportHtml)) {
+                                    $analysisReportText = $analysisReportHtml;
+                                }
 
-                            $ins = $pdo->prepare('INSERT INTO analysis_reports (user_id, spreadsheet_id, user_request, dataset_profile_json, inferred_context_json, analytics_json, charts_json, report_text) VALUES (:uid, :sid, :req, :dp, :ic, :an, :cj, :rt)');
-                            try {
-                                $ins->execute([
-                                    'uid' => (int)$user['id'],
-                                    'sid' => (int)$spreadsheetId,
-                                    'req' => $prompt,
-                                    'dp'  => json_encode($datasetProfileToStore, JSON_UNESCAPED_UNICODE),
-                                    'ic'  => json_encode($result['inferred_context'] ?? null, JSON_UNESCAPED_UNICODE),
-                                    'an'  => json_encode($result['analytics'] ?? null, JSON_UNESCAPED_UNICODE),
-                                    'cj'  => json_encode($chartsList, JSON_UNESCAPED_UNICODE),
-                                    'rt'  => $analysisReportHtml ?: $analysisReportText,
-                                ]);
-                                $analysisReportId = (int)$pdo->lastInsertId();
-                            } catch (PDOException $e) {
-                                $msg = $e->getMessage();
-                                $isMissingTable = (strpos($msg, 'SQLSTATE[42S02]') !== false) || (strpos($msg, "doesn't exist") !== false);
-                                $mentionsTable = (strpos($msg, 'analysis_reports') !== false);
-                                if ($isMissingTable && $mentionsTable) {
-                                    $error = 'Missing database table `analysis_reports`. Please run migration: database/20260207_000002_create_analysis_reports.sql';
-                                } else {
-                                    throw $e;
+                                $datasetProfileToStore = $result['dataset_profile'] ?? null;
+                                if (is_array($datasetProfileToStore) && array_key_exists('sample_rows', $datasetProfileToStore)) {
+                                    unset($datasetProfileToStore['sample_rows']);
+                                }
+
+                                $ins = $pdo->prepare('INSERT INTO analysis_reports (user_id, spreadsheet_id, user_request, dataset_profile_json, inferred_context_json, analytics_json, charts_json, report_text) VALUES (:uid, :sid, :req, :dp, :ic, :an, :cj, :rt)');
+                                try {
+                                    $ins->execute([
+                                        'uid' => (int)$user['id'],
+                                        'sid' => (int)$spreadsheetId,
+                                        'req' => $prompt,
+                                        'dp'  => json_encode($datasetProfileToStore, JSON_UNESCAPED_UNICODE),
+                                        'ic'  => json_encode($result['inferred_context'] ?? null, JSON_UNESCAPED_UNICODE),
+                                        'an'  => json_encode($result['analytics'] ?? null, JSON_UNESCAPED_UNICODE),
+                                        'cj'  => json_encode($chartsList, JSON_UNESCAPED_UNICODE),
+                                        'rt'  => $analysisReportHtml ?: $analysisReportText,
+                                    ]);
+                                    $analysisReportId = (int)$pdo->lastInsertId();
+                                } catch (PDOException $e) {
+                                    $msg = $e->getMessage();
+                                    $isMissingTable = (strpos($msg, 'SQLSTATE[42S02]') !== false) || (strpos($msg, "doesn't exist") !== false);
+                                    $mentionsTable = (strpos($msg, 'analysis_reports') !== false);
+                                    if ($isMissingTable && $mentionsTable) {
+                                        $error = 'Missing database table `analysis_reports`. Please run migration: database/20260207_000002_create_analysis_reports.sql';
+                                    } else {
+                                        throw $e;
+                                    }
                                 }
                             }
                         }
                     }
 
                     // Salva registro(s) de gráfico com payload (stub ou IA real)
-                    if ($aiPayload['status'] === 'ok' && !empty($aiPayload['charts'])) {
-                        $stmt = $pdo->prepare('INSERT INTO charts (user_id, spreadsheet_id, prompt, chart_type, data_json) VALUES (:user_id, :spreadsheet_id, :prompt, :chart_type, :data_json)');
+                    if (empty($aiPayload['needs_clarification'])) {
+                        if ($aiPayload['status'] === 'ok' && !empty($aiPayload['charts'])) {
+                            $stmt = $pdo->prepare('INSERT INTO charts (user_id, spreadsheet_id, prompt, chart_type, data_json) VALUES (:user_id, :spreadsheet_id, :prompt, :chart_type, :data_json)');
 
-                        foreach ($aiPayload['charts'] as $chartConfig) {
+                            foreach ($aiPayload['charts'] as $chartConfig) {
+                                $stmt->execute([
+                                    'user_id'        => $user['id'],
+                                    'spreadsheet_id' => $spreadsheetId,
+                                    'prompt'         => $prompt,
+                                    'chart_type'     => $chartConfig['chart_type'] ?? null,
+                                    'data_json'      => json_encode($chartConfig),
+                                ]);
+
+                                // Prepara dados para renderização no frontend
+                                $labels = isset($chartConfig['labels']) && is_array($chartConfig['labels']) ? $chartConfig['labels'] : [];
+                                $valuesRaw = isset($chartConfig['values']) && is_array($chartConfig['values']) ? $chartConfig['values'] : [];
+                                $values = [];
+                                foreach ($valuesRaw as $v) {
+                                    $values[] = (float)$v;
+                                }
+
+                                if ($labels && $values && count($labels) === count($values)) {
+                                    $rawType = $chartConfig['chart_type'] ?? 'line';
+                                    $renderType = $rawType;
+                                    if (in_array($rawType, ['boxplot', 'gantt'], true)) {
+                                        $renderType = 'bar';
+                                    }
+                                    $chartsData[] = [
+                                        'type'   => $renderType,
+                                        'title'  => $chartConfig['title'] ?? 'Generated chart',
+                                        'labels' => $labels,
+                                        'values' => $values,
+                                    ];
+                                }
+                            }
+                        } else {
+                            // Mesmo em modo stub, salvamos um registro simples para manter histórico
+                            $stmt = $pdo->prepare('INSERT INTO charts (user_id, spreadsheet_id, prompt, chart_type, data_json) VALUES (:user_id, :spreadsheet_id, :prompt, :chart_type, :data_json)');
                             $stmt->execute([
                                 'user_id'        => $user['id'],
                                 'spreadsheet_id' => $spreadsheetId,
                                 'prompt'         => $prompt,
-                                'chart_type'     => $chartConfig['chart_type'] ?? null,
-                                'data_json'      => json_encode($chartConfig),
+                                'chart_type'     => null,
+                                'data_json'      => json_encode($aiPayload),
                             ]);
-
-                            // Prepara dados para renderização no frontend
-                            $labels = isset($chartConfig['labels']) && is_array($chartConfig['labels']) ? $chartConfig['labels'] : [];
-                            $valuesRaw = isset($chartConfig['values']) && is_array($chartConfig['values']) ? $chartConfig['values'] : [];
-                            $values = [];
-                            foreach ($valuesRaw as $v) {
-                                $values[] = (float)$v;
-                            }
-
-                            if ($labels && $values && count($labels) === count($values)) {
-                                $rawType = $chartConfig['chart_type'] ?? 'line';
-                                $renderType = $rawType;
-                                if (in_array($rawType, ['boxplot', 'gantt'], true)) {
-                                    $renderType = 'bar';
-                                }
-                                $chartsData[] = [
-                                    'type'   => $renderType,
-                                    'title'  => $chartConfig['title'] ?? 'Generated chart',
-                                    'labels' => $labels,
-                                    'values' => $values,
-                                ];
-                            }
                         }
-                    } else {
-                        // Mesmo em modo stub, salvamos um registro simples para manter histórico
-                        $stmt = $pdo->prepare('INSERT INTO charts (user_id, spreadsheet_id, prompt, chart_type, data_json) VALUES (:user_id, :spreadsheet_id, :prompt, :chart_type, :data_json)');
-                        $stmt->execute([
-                            'user_id'        => $user['id'],
-                            'spreadsheet_id' => $spreadsheetId,
-                            'prompt'         => $prompt,
-                            'chart_type'     => null,
-                            'data_json'      => json_encode($aiPayload),
-                        ]);
                     }
 
                     $lastChartResponse = $aiPayload;
@@ -188,10 +214,14 @@ class DashboardController
                         $lastChartResponse['dashboard_plan'] = $result['dashboard_plan'] ?? null;
                     }
 
-                    if ($aiPayload['status'] === 'ok' && !$error) {
-                        $success = 'Analysis generated successfully.';
-                    } elseif (!$error) {
-                        $success = 'Analysis generated (stub).';
+                    if (!$error) {
+                        if (!empty($aiPayload['needs_clarification'])) {
+                            $success = 'Need clarification to improve accuracy.';
+                        } elseif ($aiPayload['status'] === 'ok') {
+                            $success = 'Analysis generated successfully.';
+                        } else {
+                            $success = 'Analysis generated (stub).';
+                        }
                     }
                 }
             }

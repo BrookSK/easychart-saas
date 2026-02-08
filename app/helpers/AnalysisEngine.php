@@ -2,7 +2,7 @@
 
 class AnalysisEngine
 {
-    public static function run(array $table, ?string $userRequest = null): array
+    public static function run(array $table, ?string $userRequest = null, array $overrides = []): array
     {
         $headers = $table['headers'] ?? [];
         $rows = $table['rows'] ?? [];
@@ -20,6 +20,46 @@ class AnalysisEngine
         $requestPlan = self::interpretUserRequest($cleanHeaders, $typed, $profile, $userRequest, $columnMap);
         $context = self::inferContext($cleanHeaders, $typed, $profile, $requestPlan, $columnMap);
 
+        // Overrides (respostas do usuário) podem travar colunas e evitar ambiguidades.
+        if (!empty($overrides) && is_array($overrides)) {
+            self::applyOverrides($cleanHeaders, $typed, $profile, $overrides, $columnMap, $requestPlan, $context);
+        }
+
+        // Gate de confiabilidade: se houver ambiguidade relevante, perguntamos antes de gerar gráficos.
+        $clarification = self::buildClarificationQuestions($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context);
+        if (!empty($clarification['needs_clarification'])) {
+            return [
+                'needs_clarification' => true,
+                'questions' => $clarification['questions'] ?? [],
+                'dataset_profile' => $profile,
+                'inferred_context' => $context,
+                'column_map' => $columnMap,
+                'request_plan' => $requestPlan,
+                'dashboard_plan' => null,
+                'analytics' => null,
+                'charts' => [],
+                'report_text' => null,
+                'report_html' => null,
+                'stages' => [
+                    '1' => [
+                        'title' => 'Análise do arquivo e alinhamento do objetivo',
+                        'context' => $context,
+                        'column_map' => $columnMap,
+                        'request_plan' => $requestPlan,
+                        'dataset_profile' => [
+                            'columns' => $profile['columns'] ?? [],
+                            'volume' => $profile['volume'] ?? null,
+                            'period' => $profile['period'] ?? null,
+                        ],
+                    ],
+                    'clarification' => [
+                        'title' => 'Desambiguação (necessária)',
+                        'questions' => $clarification['questions'] ?? [],
+                    ],
+                ],
+            ];
+        }
+
         // ETAPA 2: O que é relevante (insights/indicadores) para o pedido
         $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan, $columnMap);
         $dashboardPlan = self::buildDashboardPlan($profile, $context, $analytics, $requestPlan, $columnMap);
@@ -32,6 +72,8 @@ class AnalysisEngine
         $reportText = self::buildReport($profile, $context, $analytics, $charts);
 
         return [
+            'needs_clarification' => false,
+            'questions' => [],
             'dataset_profile' => $profile,
             'inferred_context' => $context,
             'column_map' => $columnMap,
@@ -66,6 +108,143 @@ class AnalysisEngine
                     'report_html' => $reportHtml,
                 ],
             ],
+        ];
+    }
+
+    private static function applyOverrides(array $headers, array $types, array $profile, array $overrides, array &$columnMap, array &$requestPlan, array &$context): void
+    {
+        $forceConservative = (bool)($overrides['force_conservative'] ?? false);
+        if (!empty($overrides['skip_clarification'])) {
+            $forceConservative = true;
+        }
+
+        $resolveHeader = function($v) use ($headers): ?string {
+            $s = trim((string)$v);
+            if ($s === '') {
+                return null;
+            }
+            foreach ($headers as $h) {
+                if ((string)$h === $s) {
+                    return (string)$h;
+                }
+            }
+            return null;
+        };
+
+        $amount = $resolveHeader($overrides['amount_column'] ?? null);
+        if ($amount !== null) {
+            $columnMap['amount'] = ['column' => $amount, 'confidence' => 1.0];
+            $context['main_metric'] = $amount;
+        }
+
+        $date = $resolveHeader($overrides['date_column'] ?? null);
+        if ($date !== null) {
+            $columnMap['date'] = ['column' => $date, 'confidence' => 1.0];
+            $context['time_axis'] = $date;
+        }
+
+        $category = $resolveHeader($overrides['category_column'] ?? null);
+        if ($category !== null) {
+            $columnMap['category'] = ['column' => $category, 'confidence' => 1.0];
+            $context['main_entity'] = $category;
+        }
+
+        if ($forceConservative) {
+            $requestPlan['force_conservative'] = true;
+        }
+
+        // Ajuste opcional do "modo" financeiro (despesa/receita/cashflow)
+        $mode = trim((string)($overrides['finance_mode'] ?? ''));
+        if ($mode !== '') {
+            $requestPlan['finance_mode'] = $mode;
+        }
+    }
+
+    private static function buildClarificationQuestions(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context): array
+    {
+        if ((bool)($requestPlan['force_conservative'] ?? false)) {
+            return ['needs_clarification' => false, 'questions' => []];
+        }
+
+        $questions = [];
+
+        $amountCol = $columnMap['amount']['column'] ?? null;
+        $amountConf = (float)($columnMap['amount']['confidence'] ?? 0.0);
+        $dateCol = $columnMap['date']['column'] ?? null;
+        $dateConf = (float)($columnMap['date']['confidence'] ?? 0.0);
+        $catCol = $columnMap['category']['column'] ?? null;
+        $catConf = (float)($columnMap['category']['confidence'] ?? 0.0);
+
+        $intents = $requestPlan['intents'] ?? ['auto'];
+        if (!is_array($intents) || empty($intents)) {
+            $intents = ['auto'];
+        }
+        $wantsTime = in_array('time_series', $intents, true);
+
+        $numericCols = [];
+        $temporalCols = [];
+        $categoricalCols = [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            if ($t === 'numerica') {
+                $numericCols[] = (string)$h;
+            } elseif ($t === 'temporal') {
+                $temporalCols[] = (string)$h;
+            } else {
+                $categoricalCols[] = (string)$h;
+            }
+        }
+
+        // 1) Valor principal
+        if ($amountCol === null || $amountCol === '' || $amountConf < 0.72) {
+            if (!empty($numericCols)) {
+                $questions[] = [
+                    'id' => 'amount_column',
+                    'type' => 'select',
+                    'label' => 'Qual coluna representa o VALOR principal?',
+                    'why' => 'Sem isso, ganhos/perdas e rankings podem ficar incorretos.',
+                    'options' => $numericCols,
+                    'default' => is_string($amountCol) ? $amountCol : null,
+                ];
+            }
+        }
+
+        // 2) Eixo temporal (se solicitado)
+        if ($wantsTime && ($dateCol === null || $dateCol === '' || $dateConf < 0.72)) {
+            if (!empty($temporalCols)) {
+                $questions[] = [
+                    'id' => 'date_column',
+                    'type' => 'select',
+                    'label' => 'Qual coluna representa a DATA principal?',
+                    'why' => 'Sem isso, linha do tempo e previsibilidade podem ficar incorretas.',
+                    'options' => $temporalCols,
+                    'default' => is_string($dateCol) ? $dateCol : null,
+                ];
+            }
+        }
+
+        // 3) Dimensão/categoria
+        if ($catCol === null || $catCol === '' || $catConf < 0.60) {
+            if (!empty($categoricalCols)) {
+                $questions[] = [
+                    'id' => 'category_column',
+                    'type' => 'select',
+                    'label' => 'Qual coluna devo usar como CATEGORIA/DIMENSÃO para agrupar?',
+                    'why' => 'Isso muda completamente os rankings e gráficos de participação.',
+                    'options' => array_slice($categoricalCols, 0, 40),
+                    'default' => is_string($catCol) ? $catCol : null,
+                ];
+            }
+        }
+
+        // Limite de perguntas (UX)
+        if (count($questions) > 3) {
+            $questions = array_slice($questions, 0, 3);
+        }
+
+        return [
+            'needs_clarification' => !empty($questions),
+            'questions' => $questions,
         ];
     }
 
@@ -1091,6 +1270,12 @@ class AnalysisEngine
         $wantComparison = in_array('comparison', $intents, true) || in_array('auto', $intents, true);
         $wantDistribution = in_array('distribution', $intents, true) || in_array('auto', $intents, true);
         $wantShare = in_array('share', $intents, true) || in_array('auto', $intents, true);
+
+        if (!empty($requestPlan['force_conservative'])) {
+            // Em modo conservador, evitamos séries temporais/forecast/gantt e distribuições que poluem.
+            $wantTime = false;
+            $wantDistribution = false;
+        }
 
         // Finance overview (ganhos x perdas / saldo) - aparece cedo para deixar o dashboard claro
         if (!empty($analytics['finance']['cashflow'])) {

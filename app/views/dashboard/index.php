@@ -350,7 +350,7 @@
                             <option value=""><?= Lang::get('Choose a spreadsheet...') ?></option>
                             <?php if (!empty($spreadsheets)): ?>
                                 <?php foreach ($spreadsheets as $sheet): ?>
-                                    <option value="<?= (int)$sheet['id'] ?>"><?= htmlspecialchars($sheet['original_name']) ?></option>
+                                    <option value="<?= (int)$sheet['id'] ?>" <?= (!empty($spreadsheetId) && (int)$spreadsheetId === (int)$sheet['id']) ? 'selected' : '' ?>><?= htmlspecialchars($sheet['original_name']) ?></option>
                                 <?php endforeach; ?>
                             <?php endif; ?>
                         </select>
@@ -367,15 +367,53 @@
                 <div class="field-row">
                     <div>
                         <div class="field-label"><?= Lang::get('What do you want to visualize?') ?></div>
-                        <input class="input" name="prompt" placeholder="<?= Lang::get('Show sales trend over time') ?> <?= Lang::get('or') ?> <?= Lang::get('Compare revenue by region') ?>">
+                        <input class="input" name="prompt" value="<?= htmlspecialchars($prompt ?? '') ?>" placeholder="<?= Lang::get('Show sales trend over time') ?> <?= Lang::get('or') ?> <?= Lang::get('Compare revenue by region') ?>">
                     </div>
                 </div>
 
-                <button class="btn-generate" type="submit"><?= Lang::get('Generate') ?></button>
+                <?php if (!empty($clarificationQuestions) && is_array($clarificationQuestions)): ?>
+                    <div style="margin-top:12px;border:1px solid #e5e7eb;border-radius:12px;padding:12px 12px;background:#f8fafc;">
+                        <div style="font-weight:600;margin-bottom:6px;">Desambiguação necessária</div>
+                        <div style="font-size:13px;color:#475569;margin-bottom:10px;">Responda rapidamente para aumentar a precisão. Você também pode pular e gerar um dashboard conservador.</div>
 
-                <div class="helper-box">
-                    <?= Lang::get('Upload your first spreadsheet to start generating charts with AI') ?>.
-                </div>
+                        <?php foreach ($clarificationQuestions as $q): ?>
+                            <?php
+                                $qid = (string)($q['id'] ?? '');
+                                $qlabel = (string)($q['label'] ?? '');
+                                $qwhy = (string)($q['why'] ?? '');
+                                $qopts = $q['options'] ?? [];
+                                $qdef = $q['default'] ?? null;
+                            ?>
+                            <?php if ($qid !== '' && $qlabel !== '' && is_array($qopts) && !empty($qopts)): ?>
+                                <div style="margin-bottom:10px;">
+                                    <div class="field-label" style="margin-bottom:4px;"><?= htmlspecialchars($qlabel) ?></div>
+                                    <?php if ($qwhy !== ''): ?>
+                                        <div style="font-size:12px;color:#64748b;margin-bottom:6px;"><?= htmlspecialchars($qwhy) ?></div>
+                                    <?php endif; ?>
+                                    <select class="select" name="overrides[<?= htmlspecialchars($qid) ?>]">
+                                        <option value="">Selecione...</option>
+                                        <?php foreach ($qopts as $opt): ?>
+                                            <?php $optStr = (string)$opt; ?>
+                                            <option value="<?= htmlspecialchars($optStr) ?>" <?= ($qdef !== null && (string)$qdef === $optStr) ? 'selected' : '' ?>><?= htmlspecialchars($optStr) ?></option>
+                                        <?php endforeach; ?>
+                                    </select>
+                                </div>
+                            <?php endif; ?>
+                        <?php endforeach; ?>
+
+                        <div style="display:flex;gap:10px;align-items:center;margin-top:10px;">
+                            <button class="btn-generate" type="submit">Reprocessar</button>
+                            <button class="btn-generate" type="submit" name="skip_clarification" value="1" style="background:#64748b;">Pular (modo conservador)</button>
+                        </div>
+                    </div>
+                <?php else: ?>
+
+                    <button class="btn-generate" type="submit"><?= Lang::get('Generate') ?></button>
+
+                    <div class="helper-box">
+                        <?= Lang::get('Upload your first spreadsheet to start generating charts with AI') ?>.
+                    </div>
+                <?php endif; ?>
             </form>
         </section>
         <?php if (!empty($chartsData)): ?>
