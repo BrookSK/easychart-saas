@@ -2071,6 +2071,13 @@ class AnalysisEngine
                             'count_positive' => $countPos,
                             'count_negative' => $countNeg,
                         ];
+                    }
+                }
+            }
+
+            $entityIdx = false;
+            if (is_string($entity) && $entity !== '') {
+                $entityIdx = array_search($entity, $headers, true);
             }
             if ($entityIdx !== false) {
                 $agg = [];
