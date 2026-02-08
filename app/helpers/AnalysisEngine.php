@@ -284,10 +284,6 @@ class AnalysisEngine
 
     private static function buildClarificationQuestions(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context, array $consistency): array
     {
-        if ((bool)($requestPlan['force_conservative'] ?? false)) {
-            return ['needs_clarification' => false, 'questions' => []];
-        }
-
         $questions = [];
 
         $hyp = $consistency['hypotheses'] ?? [];
@@ -314,6 +310,10 @@ class AnalysisEngine
             $intents = ['auto'];
         }
         $wantsTime = in_array('time_series', $intents, true);
+        $wantsComparison = in_array('comparison', $intents, true);
+        $wantsShare = in_array('share', $intents, true);
+        $wantsDistribution = in_array('distribution', $intents, true);
+        $wantsAnyCharts = in_array('auto', $intents, true) || $wantsTime || $wantsComparison || $wantsShare || $wantsDistribution;
 
         $numericCols = [];
         $temporalCols = [];
@@ -332,6 +332,86 @@ class AnalysisEngine
         $ambiguities = $consistency['ambiguities'] ?? [];
         if (!is_array($ambiguities)) {
             $ambiguities = [];
+        }
+
+        $strictThresholdAmount = 0.90;
+        $strictThresholdDate = 0.90;
+        $strictThresholdCategory = 0.90;
+
+        $needsAmount = $wantsAnyCharts;
+        $needsDate = $wantsTime;
+        $needsCategory = $wantsAnyCharts;
+
+        if ($needsAmount && (!is_string($amountCol) || $amountCol === '' || $amountConf < $strictThresholdAmount)) {
+            $amountOpts = [];
+            if (!empty($hyp['amount']) && is_array($hyp['amount'])) {
+                foreach ($hyp['amount'] as $h) {
+                    if (!empty($h['column'])) {
+                        $amountOpts[] = (string)$h['column'];
+                    }
+                }
+            }
+            if (empty($amountOpts)) {
+                $amountOpts = $numericCols;
+            }
+            if (!empty($amountOpts)) {
+                $questions[] = [
+                    'id' => 'amount_column',
+                    'type' => 'select',
+                    'label' => 'Qual coluna representa o VALOR principal?',
+                    'why' => 'Precisamos confirmar o valor para garantir precisão matemática e evitar gráficos enganosos.',
+                    'options' => array_values(array_unique($amountOpts)),
+                    'default' => is_string($amountCol) ? $amountCol : null,
+                ];
+            }
+        }
+
+        if (count($questions) < 2 && $needsDate && (!is_string($dateCol) || $dateCol === '' || $dateConf < $strictThresholdDate)) {
+            $dateOpts = [];
+            if (!empty($hyp['date']) && is_array($hyp['date'])) {
+                foreach ($hyp['date'] as $h) {
+                    if (!empty($h['column'])) {
+                        $dateOpts[] = (string)$h['column'];
+                    }
+                }
+            }
+            if (empty($dateOpts)) {
+                $dateOpts = $temporalCols;
+            }
+            if (!empty($dateOpts)) {
+                $questions[] = [
+                    'id' => 'date_column',
+                    'type' => 'select',
+                    'label' => 'Qual coluna representa a DATA principal?',
+                    'why' => 'Sem a data confirmada, séries temporais e tendências podem ficar incorretas.',
+                    'options' => array_values(array_unique($dateOpts)),
+                    'default' => is_string($dateCol) ? $dateCol : null,
+                ];
+            }
+        }
+
+        if (count($questions) < 2 && $needsCategory && (!is_string($catCol) || $catCol === '' || $catConf < $strictThresholdCategory)) {
+            $catOpts = [];
+            if (!empty($hyp['category']) && is_array($hyp['category'])) {
+                foreach ($hyp['category'] as $h) {
+                    if (!empty($h['column'])) {
+                        $catOpts[] = (string)$h['column'];
+                    }
+                }
+            }
+            if (empty($catOpts)) {
+                $catOpts = array_slice($categoricalCols, 0, 40);
+            }
+            if (!empty($catOpts)) {
+                $questions[] = [
+                    'id' => 'category_column',
+                    'type' => 'select',
+                    'label' => 'Qual coluna devo usar como CATEGORIA/DIMENSÃO para agrupar?',
+                    'why' => 'Sem a categoria confirmada, rankings/participação podem ser interpretados errado.',
+                    'options' => array_values(array_unique($catOpts)),
+                    'default' => is_string($catCol) ? $catCol : null,
+                ];
+            }
         }
 
         $impactRank = [
@@ -387,7 +467,7 @@ class AnalysisEngine
                 $catOpts = array_slice($categoricalCols, 0, 40);
             }
 
-            if ($role === 'amount' && !empty($amountOpts) && ($amountCol === null || $amountCol === '' || $amountConf < 0.85)) {
+            if ($role === 'amount' && !empty($amountOpts) && ($amountCol === null || $amountCol === '' || $amountConf < 0.90)) {
                 $questions[] = [
                     'id' => 'amount_column',
                     'type' => 'select',
@@ -398,7 +478,7 @@ class AnalysisEngine
                 ];
                 $asked[$role] = true;
             }
-            if ($role === 'date' && $wantsTime && !empty($dateOpts) && ($dateCol === null || $dateCol === '' || $dateConf < 0.85)) {
+            if ($role === 'date' && $wantsTime && !empty($dateOpts) && ($dateCol === null || $dateCol === '' || $dateConf < 0.90)) {
                 $questions[] = [
                     'id' => 'date_column',
                     'type' => 'select',
@@ -409,7 +489,7 @@ class AnalysisEngine
                 ];
                 $asked[$role] = true;
             }
-            if ($role === 'category' && !empty($catOpts) && ($catCol === null || $catCol === '' || $catConf < 0.70)) {
+            if ($role === 'category' && !empty($catOpts) && ($catCol === null || $catCol === '' || $catConf < 0.90)) {
                 $questions[] = [
                     'id' => 'category_column',
                     'type' => 'select',
@@ -2269,6 +2349,15 @@ class AnalysisEngine
                 $min = $min === null ? $vv : min($min, $vv);
             }
 
+            $absSum = 0.0;
+            $absMax = null;
+            foreach ($values as $v) {
+                $vv = abs((float)$v);
+                $absSum += $vv;
+                $absMax = $absMax === null ? $vv : max($absMax, $vv);
+            }
+            $dominance = $absSum > 0 ? ((float)$absMax / (float)$absSum) : 1.0;
+
             if ($nonZeroCount($values) <= 0) {
                 return;
             }
@@ -2277,15 +2366,7 @@ class AnalysisEngine
                 if (count($labels) < 2) {
                     return;
                 }
-                $absSum = 0.0;
-                $absMax = null;
-                foreach ($values as $v) {
-                    $vv = abs((float)$v);
-                    $absSum += $vv;
-                    $absMax = $absMax === null ? $vv : max($absMax, $vv);
-                }
-                $share = $absSum > 0 ? ((float)$absMax / (float)$absSum) : 1.0;
-                if ($share >= 0.95) {
+                if ($dominance >= 0.95) {
                     return;
                 }
             }
@@ -2302,6 +2383,23 @@ class AnalysisEngine
                     if ($nonZeroCount($values) <= 1) {
                         return;
                     }
+                    // Evita “histograma” degenerado: 95%+ em um único bin.
+                    if (count($labels) >= 4 && $dominance >= 0.95) {
+                        return;
+                    }
+                }
+
+                // Evita ranking enganoso: 95%+ do total em uma única categoria (top1 domina).
+                // Mantém barras pequenas (ex.: 2-3 labels) porque podem ser comparações válidas.
+                if (count($labels) >= 4 && $dominance >= 0.95) {
+                    return;
+                }
+            }
+
+            if ($type === 'line') {
+                // Evita séries dominadas por um único pico/queda, que viram “ruído” visual.
+                if (count($labels) >= 5 && $dominance >= 0.95) {
+                    return;
                 }
             }
 
