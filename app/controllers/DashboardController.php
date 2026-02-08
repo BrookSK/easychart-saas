@@ -92,6 +92,8 @@ class DashboardController
                             $aiPayload = [
                                 'status' => 'ok',
                                 'charts' => $chartsList,
+                                'request_plan' => $result['request_plan'] ?? null,
+                                'inferred_context' => $result['inferred_context'] ?? null,
                             ];
 
                             $analysisReportText = $result['report_text'] ?? null;

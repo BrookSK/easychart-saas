@@ -15,14 +15,16 @@ class AnalysisEngine
 
         $typed = self::inferColumnTypes($cleanHeaders, $rows);
         $profile = self::buildDatasetProfile($cleanHeaders, $rows, $typed);
-        $context = self::inferContext($cleanHeaders, $typed, $profile);
-        $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context);
-        $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics);
+        $requestPlan = self::interpretUserRequest($cleanHeaders, $typed, $profile, $userRequest);
+        $context = self::inferContext($cleanHeaders, $typed, $profile, $requestPlan);
+        $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan);
+        $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics, $requestPlan);
         $report = self::buildReport($profile, $context, $analytics, $charts);
 
         return [
             'dataset_profile' => $profile,
             'inferred_context' => $context,
+            'request_plan' => $requestPlan,
             'analytics' => $analytics,
             'charts' => $charts,
             'report_text' => $report,
@@ -129,7 +131,7 @@ class AnalysisEngine
         ];
     }
 
-    private static function inferContext(array $headers, array $types, array $profile): array
+    private static function inferContext(array $headers, array $types, array $profile, array $requestPlan): array
     {
         $domain = 'Operacional';
         $h = mb_strtolower(implode(' ', $headers));
@@ -283,6 +285,20 @@ class AnalysisEngine
             }
         }
 
+        $forcedMetric = $requestPlan['metric'] ?? null;
+        $forcedEntity = $requestPlan['entity'] ?? null;
+        $forcedTime = $requestPlan['time_axis'] ?? null;
+
+        if (is_string($forcedMetric) && $forcedMetric !== '' && in_array($forcedMetric, $headers, true)) {
+            $metricCol = $forcedMetric;
+        }
+        if (is_string($forcedEntity) && $forcedEntity !== '' && in_array($forcedEntity, $headers, true)) {
+            $entityCol = $forcedEntity;
+        }
+        if (is_string($forcedTime) && $forcedTime !== '' && in_array($forcedTime, $headers, true)) {
+            $timeCol = $forcedTime;
+        }
+
         return [
             'domain' => $domain,
             'main_entity' => $entityCol,
@@ -291,7 +307,105 @@ class AnalysisEngine
         ];
     }
 
-    private static function buildAnalytics(array $headers, array $rows, array $types, array $context): array
+    private static function interpretUserRequest(array $headers, array $types, array $profile, ?string $userRequest): array
+    {
+        $req = trim((string)$userRequest);
+        if ($req === '') {
+            return [
+                'intents' => ['auto'],
+                'metric' => null,
+                'entity' => null,
+                'time_axis' => null,
+                'limit' => null,
+                'agg' => null,
+            ];
+        }
+
+        $reqLower = mb_strtolower($req);
+
+        $intents = [];
+        if (preg_match('/\b(tend[êe]ncia|evolu[cç][aã]o|ao longo|over time|time series|s[ée]rie temporal|timeline|mensal|di[aá]rio|semanal|por dia|por m[êe]s|por ano)\b/u', $reqLower)) {
+            $intents[] = 'time_series';
+        }
+        if (preg_match('/\b(compar|comparar|vs\b|versus|ranking|top\s*\d+|maiores|melhores|piores|por\s+[\p{L}_]+)\b/u', $reqLower)) {
+            $intents[] = 'comparison';
+        }
+        if (preg_match('/\b(distribui[cç][aã]o|histograma|frequ[êe]ncia|boxplot|quartil|vari[aâ]ncia)\b/u', $reqLower)) {
+            $intents[] = 'distribution';
+        }
+        if (preg_match('/\b(participa[cç][aã]o|share|percentual|%|pizza|pie|market\s*share|propor[cç][aã]o)\b/u', $reqLower)) {
+            $intents[] = 'share';
+        }
+
+        if (empty($intents)) {
+            $intents[] = 'auto';
+        }
+
+        $limit = null;
+        if (preg_match('/\btop\s*(\d{1,3})\b/u', $reqLower, $m)) {
+            $limit = (int)$m[1];
+            if ($limit <= 0) {
+                $limit = null;
+            }
+        }
+
+        $metric = null;
+        $entity = null;
+        $timeAxis = null;
+
+        $headersLower = [];
+        foreach ($headers as $h) {
+            $headersLower[] = mb_strtolower((string)$h);
+        }
+
+        foreach ($headers as $i => $hName) {
+            $hLower = $headersLower[$i] ?? mb_strtolower((string)$hName);
+            if ($hLower === '') {
+                continue;
+            }
+            if (mb_strpos($reqLower, $hLower) !== false) {
+                $t = $types[$i] ?? 'categorica';
+                if ($t === 'numerica' && $metric === null) {
+                    $metric = $hName;
+                } elseif ($t === 'temporal' && $timeAxis === null) {
+                    $timeAxis = $hName;
+                } elseif ($t === 'categorica' && $entity === null) {
+                    $entity = $hName;
+                }
+            }
+        }
+
+        if ($timeAxis === null) {
+            foreach ($headers as $i => $hName) {
+                if (($types[$i] ?? null) === 'temporal') {
+                    if (preg_match('/\b(' . preg_quote(mb_strtolower((string)$hName), '/') . ')\b/u', $reqLower)) {
+                        $timeAxis = $hName;
+                        break;
+                    }
+                }
+            }
+        }
+
+        $agg = null;
+        if (preg_match('/\b(m[ée]dia|average|avg)\b/u', $reqLower)) {
+            $agg = 'avg';
+        } elseif (preg_match('/\b(soma|sum|total)\b/u', $reqLower)) {
+            $agg = 'sum';
+        } elseif (preg_match('/\b(contagem|count|quantidade|qtd)\b/u', $reqLower)) {
+            $agg = 'count';
+        }
+
+        return [
+            'intents' => $intents,
+            'metric' => $metric,
+            'entity' => $entity,
+            'time_axis' => $timeAxis,
+            'limit' => $limit,
+            'agg' => $agg,
+        ];
+    }
+
+    private static function buildAnalytics(array $headers, array $rows, array $types, array $context, array $requestPlan): array
     {
         $numericStats = [];
         $categoricalStats = [];
@@ -349,6 +463,7 @@ class AnalysisEngine
         $timeAxis = $context['time_axis'] ?? null;
         $metric = $context['main_metric'] ?? null;
         $entity = $context['main_entity'] ?? null;
+        $aggPref = $requestPlan['agg'] ?? null;
 
         // Comparação entidade x métrica (soma) + participação percentual
         if ($entity && $metric) {
@@ -426,11 +541,24 @@ class AnalysisEngine
         ];
     }
 
-    private static function buildCharts(array $headers, array $rows, array $types, array $context, array $analytics): array
+    private static function buildCharts(array $headers, array $rows, array $types, array $context, array $analytics, array $requestPlan): array
     {
         $charts = [];
 
-        foreach ($analytics['numeric'] as $col => $stats) {
+        $intents = $requestPlan['intents'] ?? ['auto'];
+        if (!is_array($intents) || empty($intents)) {
+            $intents = ['auto'];
+        }
+
+        $wantTime = in_array('time_series', $intents, true) || in_array('auto', $intents, true);
+        $wantComparison = in_array('comparison', $intents, true) || in_array('auto', $intents, true);
+        $wantDistribution = in_array('distribution', $intents, true) || in_array('auto', $intents, true);
+        $wantShare = in_array('share', $intents, true) || in_array('auto', $intents, true);
+
+        foreach (($analytics['numeric'] ?? []) as $col => $stats) {
+            if (!$wantDistribution) {
+                continue;
+            }
             if (($stats['count'] ?? 0) <= 0) {
                 continue;
             }
@@ -466,7 +594,11 @@ class AnalysisEngine
             }
         }
 
-        foreach ($analytics['categorical'] as $col => $info) {
+        foreach (($analytics['categorical'] ?? []) as $col => $info) {
+            if (!$wantDistribution && !$wantShare) {
+                continue;
+            }
+
             $top = $info['top'] ?? [];
             if (empty($top)) {
                 continue;
@@ -479,38 +611,48 @@ class AnalysisEngine
             $labels = array_keys($top);
             $values = array_values($top);
 
-            $charts[] = [
-                'chart_type' => 'bar',
-                'title' => 'Top categorias: ' . $col,
-                'description' => 'Ranking por contagem (top 20).',
-                'labels' => $labels,
-                'values' => $values,
-            ];
+            if ($wantDistribution) {
+                $charts[] = [
+                    'chart_type' => 'bar',
+                    'title' => 'Top categorias: ' . $col,
+                    'description' => 'Ranking por contagem (top 20).',
+                    'labels' => $labels,
+                    'values' => $values,
+                ];
+            }
 
             // Pizza: apenas quando participação faz sentido (poucas categorias e concentração relevante)
-            $total = array_sum($values);
-            $top1 = $values[0] ?? 0;
-            $top1Share = $total > 0 ? ($top1 / $total) : 0;
-            if ($total > 0 && count($labels) <= 10 && $top1Share >= 0.15) {
-                $pct = [];
-                foreach ($values as $v) {
-                    $pct[] = round(($v / $total) * 100, 2);
+            if ($wantShare) {
+                $total = array_sum($values);
+                $top1 = $values[0] ?? 0;
+                $top1Share = $total > 0 ? ($top1 / $total) : 0;
+                if ($total > 0 && count($labels) <= 10 && $top1Share >= 0.15) {
+                    $pct = [];
+                    foreach ($values as $v) {
+                        $pct[] = round(($v / $total) * 100, 2);
+                    }
+                    $charts[] = [
+                        'chart_type' => 'pie',
+                        'title' => 'Participação: ' . $col,
+                        'description' => 'Participação percentual das categorias (top).',
+                        'labels' => $labels,
+                        'values' => $pct,
+                    ];
                 }
-                $charts[] = [
-                    'chart_type' => 'pie',
-                    'title' => 'Participação: ' . $col,
-                    'description' => 'Participação percentual das categorias (top).',
-                    'labels' => $labels,
-                    'values' => $pct,
-                ];
             }
         }
 
         // Comparação entidade x métrica (soma)
-        if (!empty($analytics['comparisons']['entity_metric_sum']['top_sum'])) {
+        if ($wantComparison && !empty($analytics['comparisons']['entity_metric_sum']['top_sum'])) {
             $cmp = $analytics['comparisons']['entity_metric_sum'];
             $topAgg = $cmp['top_sum'];
-            $topAgg = array_slice($topAgg, 0, 20, true);
+
+            $limit = (int)($requestPlan['limit'] ?? 20);
+            if ($limit <= 0) {
+                $limit = 20;
+            }
+            $topAgg = array_slice($topAgg, 0, min(50, $limit), true);
+
             $charts[] = [
                 'chart_type' => 'bar',
                 'title' => 'Top ' . ($cmp['entity'] ?? 'entidades') . ' por soma de ' . ($cmp['metric'] ?? 'métrica'),
@@ -519,27 +661,29 @@ class AnalysisEngine
                 'values' => array_values($topAgg),
             ];
 
-            // Pizza por participação de soma (apenas se <= 10)
-            $shares = $cmp['top_shares'] ?? [];
-            $shares = array_slice($shares, 0, 10, true);
-            $shareVals = array_values($shares);
-            $shareTop1 = $shareVals[0] ?? 0;
-            if (!empty($shares) && count($shares) <= 10 && $shareTop1 >= 0.15) {
-                $pct = [];
-                foreach ($shares as $k => $s) {
-                    $pct[] = round((float)$s * 100, 2);
+            if ($wantShare) {
+                // Pizza por participação de soma (apenas se <= 10)
+                $shares = $cmp['top_shares'] ?? [];
+                $shares = array_slice($shares, 0, 10, true);
+                $shareVals = array_values($shares);
+                $shareTop1 = $shareVals[0] ?? 0;
+                if (!empty($shares) && count($shares) <= 10 && $shareTop1 >= 0.15) {
+                    $pct = [];
+                    foreach ($shares as $k => $s) {
+                        $pct[] = round((float)$s * 100, 2);
+                    }
+                    $charts[] = [
+                        'chart_type' => 'pie',
+                        'title' => 'Participação (soma): ' . ($cmp['entity'] ?? 'entidade'),
+                        'description' => 'Participação percentual por soma da métrica (top).',
+                        'labels' => array_keys($shares),
+                        'values' => $pct,
+                    ];
                 }
-                $charts[] = [
-                    'chart_type' => 'pie',
-                    'title' => 'Participação (soma): ' . ($cmp['entity'] ?? 'entidade'),
-                    'description' => 'Participação percentual por soma da métrica (top).',
-                    'labels' => array_keys($shares),
-                    'values' => $pct,
-                ];
             }
         }
 
-        if (!empty($analytics['temporal']['series'])) {
+        if ($wantTime && !empty($analytics['temporal']['series'])) {
             $labels = array_keys($analytics['temporal']['series']);
             $values = array_values($analytics['temporal']['series']);
             $charts[] = [
@@ -616,32 +760,34 @@ class AnalysisEngine
         }
 
         // Radar (perfil multi-métricas): quando há múltiplas colunas numéricas
-        $numericCols = array_keys($analytics['numeric'] ?? []);
-        if (count($numericCols) >= 3) {
-            $radarCols = array_slice($numericCols, 0, 8);
-            $labels = [];
-            $values = [];
-            foreach ($radarCols as $col) {
-                $st = $analytics['numeric'][$col] ?? null;
-                if (!$st || !isset($st['mean'])) {
-                    continue;
+        if (in_array('auto', $intents, true) || in_array('comparison', $intents, true)) {
+            $numericCols = array_keys($analytics['numeric'] ?? []);
+            if (count($numericCols) >= 3) {
+                $radarCols = array_slice($numericCols, 0, 8);
+                $labels = [];
+                $values = [];
+                foreach ($radarCols as $col) {
+                    $st = $analytics['numeric'][$col] ?? null;
+                    if (!$st || !isset($st['mean'])) {
+                        continue;
+                    }
+                    $labels[] = $col;
+                    // normaliza a média para 0-100 usando min/max observados
+                    $min = (float)($st['min'] ?? 0);
+                    $max = (float)($st['max'] ?? 0);
+                    $mean = (float)$st['mean'];
+                    $norm = ($max !== $min) ? (($mean - $min) / ($max - $min)) * 100.0 : 50.0;
+                    $values[] = (float)$norm;
                 }
-                $labels[] = $col;
-                // normaliza a média para 0-100 usando min/max observados
-                $min = (float)($st['min'] ?? 0);
-                $max = (float)($st['max'] ?? 0);
-                $mean = (float)$st['mean'];
-                $norm = ($max !== $min) ? (($mean - $min) / ($max - $min)) * 100.0 : 50.0;
-                $values[] = (float)$norm;
-            }
-            if (count($labels) >= 3) {
-                $charts[] = [
-                    'chart_type' => 'radar',
-                    'title' => 'Perfil de métricas (radar)',
-                    'description' => 'Comparação de múltiplas métricas normalizadas (0-100) com base em min/max observados.',
-                    'labels' => $labels,
-                    'values' => $values,
-                ];
+                if (count($labels) >= 3) {
+                    $charts[] = [
+                        'chart_type' => 'radar',
+                        'title' => 'Perfil de métricas (radar)',
+                        'description' => 'Comparação de múltiplas métricas normalizadas (0-100) com base em min/max observados.',
+                        'labels' => $labels,
+                        'values' => $values,
+                    ];
+                }
             }
         }
 
