@@ -319,8 +319,8 @@
             <section class="card-large" style="margin-bottom:16px;max-width:980px;">
                 <div class="card-header">
                     <div>
-                        <div class="card-title">Relatório técnico gerado</div>
-                        <div class="card-subtitle">Relatório no formato fixo (ETAPAS 1–9).</div>
+                        <div class="card-title">Análise Inteligente</div>
+                        <div class="card-subtitle">Análise profunda gerada por IA com base nos seus dados e na sua pergunta.</div>
                     </div>
                     <?php if (!empty($analysisReportId)): ?>
                         <a href="<?= BASE_URL ?>?c=reports&a=view&id=<?= (int)$analysisReportId ?>" style="font-size:13px;color:#2563eb;text-decoration:none;">Ver relatório</a>

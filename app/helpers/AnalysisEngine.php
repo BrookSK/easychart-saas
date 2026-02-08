@@ -62,6 +62,38 @@ class AnalysisEngine
 
         $columnMap = self::mapColumns($cleanHeaders, $typed, $profile);
         $requestPlan = self::interpretUserRequest($cleanHeaders, $typed, $profile, $userRequest, $columnMap);
+
+        // Melhoria 1: IA interpreta a pergunta e gera plano analítico estruturado
+        $aiInterpretation = null;
+        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key']) && trim((string)$userRequest) !== '') {
+            $aiInterpretation = self::aiInterpretRequest((string)$userRequest, $cleanHeaders, $typed, $profile, $columnMap, $llmConfig);
+            if (is_array($aiInterpretation)) {
+                $requestPlan['ai_interpretation'] = $aiInterpretation;
+                // Sobrescreve heurística com resultado da IA (apenas campos não-nulos)
+                if (!empty($aiInterpretation['metric_op']) && in_array($aiInterpretation['metric_op'], ['count', 'sum', 'avg'], true)) {
+                    $requestPlan['agg'] = $aiInterpretation['metric_op'];
+                }
+                if (!empty($aiInterpretation['metric_column']) && is_string($aiInterpretation['metric_column']) && in_array($aiInterpretation['metric_column'], $cleanHeaders, true)) {
+                    $requestPlan['metric'] = $aiInterpretation['metric_column'];
+                }
+                if (!empty($aiInterpretation['group_by']) && is_string($aiInterpretation['group_by']) && in_array($aiInterpretation['group_by'], $cleanHeaders, true)) {
+                    $requestPlan['entity'] = $aiInterpretation['group_by'];
+                }
+                if (!empty($aiInterpretation['time_axis']) && is_string($aiInterpretation['time_axis']) && in_array($aiInterpretation['time_axis'], $cleanHeaders, true)) {
+                    $requestPlan['time_axis'] = $aiInterpretation['time_axis'];
+                }
+                if (!empty($aiInterpretation['intents']) && is_array($aiInterpretation['intents'])) {
+                    $requestPlan['intents'] = $aiInterpretation['intents'];
+                }
+                if (!empty($aiInterpretation['filters']) && is_array($aiInterpretation['filters'])) {
+                    $requestPlan['filters'] = $aiInterpretation['filters'];
+                }
+                if (!empty($aiInterpretation['textual_answer_hint']) && is_string($aiInterpretation['textual_answer_hint'])) {
+                    $requestPlan['textual_answer_hint'] = $aiInterpretation['textual_answer_hint'];
+                }
+            }
+        }
+
         $context = self::inferContext($cleanHeaders, $typed, $profile, $requestPlan, $columnMap);
 
         // Overrides (respostas do usuário) podem travar colunas e evitar ambiguidades.
@@ -254,9 +286,17 @@ class AnalysisEngine
             $charts = self::aiRefineCharts($charts, $cleanHeaders, $typed, $profile, $context, $requestPlan, $llmConfig);
         }
 
-        // ETAPA 4: Relatório final (formatado / "bonito")
+        // ETAPA 4: Relatório final — IA gera análise textual profunda (4 níveis)
         $reportHtml = self::buildReportHtml($profile, $context, $analytics, $charts, $dashboardPlan, $userRequest);
         $reportText = self::buildReport($profile, $context, $analytics, $charts);
+
+        // Melhoria 2: Análise textual profunda via IA (substitui relatório mecânico)
+        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
+            $aiAnalysis = self::aiGenerateAnalysis($analytics, $charts, $profile, $context, $requestPlan, $llmConfig);
+            if (is_string($aiAnalysis) && trim($aiAnalysis) !== '') {
+                $reportHtml = $aiAnalysis;
+            }
+        }
 
         return [
             'needs_clarification' => false,
@@ -3984,7 +4024,31 @@ class AnalysisEngine
             "Você é um analista de dados especializado em normalização de planilhas.\n" .
             "Retorne APENAS JSON válido. Não inclua texto fora do JSON.\n" .
             "Objetivo: propor regras conservadoras para normalizar números/moedas, datas e categorias (aliases) para melhorar parsing e consistência.\n" .
+            "IMPORTANTE para colunas categóricas: analise a lista de entidades únicas fornecida e agrupe sinônimos/variações do mesmo nome.\n" .
+            "Exemplos: 'CAIXA ECONOMICA FEDERAL' e 'CEF' devem virar o mesmo; 'Banco do Brasil S.A.' e 'BANCO DO BRASIL' também.\n" .
             "Não invente dados. Se não tiver confiança, não proponha regra para a coluna.";
+
+        // Melhoria 3: coletar entidades únicas de colunas categóricas para a IA agrupar sinônimos
+        $uniqueEntities = [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            if ($t !== 'categorica') {
+                continue;
+            }
+            $seen = [];
+            foreach ($rows as $row) {
+                $v = trim((string)($row[$i] ?? ''));
+                if ($v !== '' && !isset($seen[$v])) {
+                    $seen[$v] = true;
+                }
+                if (count($seen) >= 60) {
+                    break;
+                }
+            }
+            if (count($seen) >= 2 && count($seen) <= 60) {
+                $uniqueEntities[(string)$h] = array_keys($seen);
+            }
+        }
 
         $user = [
             'user_request' => (string)($userRequest ?? ''),
@@ -3992,6 +4056,7 @@ class AnalysisEngine
             'types_initial' => $types,
             'profile_columns' => $colProfiles,
             'sample_rows' => $sample,
+            'unique_entities_by_column' => $uniqueEntities,
             'output_schema' => [
                 'version' => '1',
                 'columns' => [
@@ -4283,6 +4348,145 @@ class AnalysisEngine
         $normalizationLog['metrics'] = $metrics;
 
         return $rows;
+    }
+
+    private static function aiInterpretRequest(string $userRequest, array $headers, array $types, array $profile, array $columnMap, array $llmConfig): ?array
+    {
+        $req = trim($userRequest);
+        if ($req === '') {
+            return null;
+        }
+
+        $colSummary = [];
+        $columnProfiles = $profile['column_profiles'] ?? [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            $cp = $columnProfiles[$h] ?? [];
+            $entry = ['name' => $h, 'type' => $t];
+            if ($t === 'numerica') {
+                $entry['sample_stats'] = [
+                    'completeness' => round((float)($cp['completeness'] ?? 0), 2),
+                    'neg_ratio' => round((float)($cp['neg_ratio'] ?? 0), 2),
+                ];
+            } elseif ($t === 'categorica') {
+                $entry['unique_ratio'] = round((float)($cp['unique_ratio'] ?? 0), 2);
+                $top = $cp['top_values'] ?? [];
+                if (is_array($top)) {
+                    $entry['top_values'] = array_slice($top, 0, 5);
+                }
+            }
+            $colSummary[] = $entry;
+        }
+
+        $sys = self::governancePrompt() . "\n\n" .
+            "Você é o motor de interpretação de perguntas do usuário sobre dados tabulares.\n" .
+            "Sua tarefa: analisar a pergunta do usuário e retornar um plano analítico estruturado em JSON.\n" .
+            "Considere APENAS as colunas disponíveis. Não invente colunas.\n" .
+            "Se a pergunta for vaga, escolha a interpretação mais útil e declare em 'interpretation'.\n" .
+            "Retorne APENAS JSON válido, sem texto fora do JSON.";
+
+        $user = [
+            'user_question' => $req,
+            'available_columns' => $colSummary,
+            'current_mapping' => [
+                'amount' => $columnMap['amount']['column'] ?? null,
+                'date' => $columnMap['date']['column'] ?? null,
+                'category' => $columnMap['category']['column'] ?? null,
+            ],
+            'output_schema' => [
+                'interpretation' => 'string: reformulação clara da pergunta em 1 frase',
+                'metric_op' => 'count|sum|avg',
+                'metric_column' => 'string|null: nome exato da coluna numérica (null se count)',
+                'group_by' => 'string|null: nome exato da coluna categórica para agrupar',
+                'time_axis' => 'string|null: nome exato da coluna temporal (só se a pergunta pede evolução/tendência)',
+                'time_bucket' => 'day|month|year|null',
+                'filters' => 'array de {column, op, value} ou []',
+                'intents' => 'array de: comparison|time_series|distribution|share|ranking|summary',
+                'suggested_charts' => 'array de: bar|line|pie|table (máx 3)',
+                'textual_answer_hint' => 'string: esboço de como responder textualmente antes dos gráficos',
+            ],
+        ];
+
+        $model = (string)($llmConfig['model'] ?? 'gpt-4o-mini');
+        $resp = OpenAIClient::jsonCall((string)$llmConfig['api_key'], $model, $sys, json_encode($user, JSON_UNESCAPED_UNICODE), 0.1);
+        if (empty($resp['ok']) || !is_array($resp['data'])) {
+            return null;
+        }
+
+        return $resp['data'];
+    }
+
+    private static function aiGenerateAnalysis(array $analytics, array $charts, array $profile, array $context, array $requestPlan, array $llmConfig): ?string
+    {
+        $userRequest = trim((string)($requestPlan['raw'] ?? ''));
+
+        $totalRows = (int)($profile['volume']['total_rows'] ?? 0);
+        $period = $profile['period'] ?? null;
+        $domain = $context['domain'] ?? 'geral';
+
+        $topRanking = [];
+        $rankingData = $analytics['ranking'] ?? [];
+        if (is_array($rankingData)) {
+            $topRanking = array_slice($rankingData, 0, 10);
+        }
+
+        $kpis = [];
+        if (!empty($analytics['total'])) {
+            $kpis['total'] = $analytics['total'];
+        }
+        if (!empty($analytics['count'])) {
+            $kpis['count'] = $analytics['count'];
+        }
+        if (!empty($analytics['avg'])) {
+            $kpis['avg'] = $analytics['avg'];
+        }
+        if (!empty($analytics['unique_entities'])) {
+            $kpis['unique_entities'] = $analytics['unique_entities'];
+        }
+
+        $chartSummaries = [];
+        foreach (array_slice($charts, 0, 3) as $c) {
+            $chartSummaries[] = [
+                'type' => $c['chart_type'] ?? null,
+                'title' => $c['title'] ?? null,
+                'labels_top5' => array_slice($c['labels'] ?? [], 0, 5),
+                'values_top5' => array_slice($c['values'] ?? [], 0, 5),
+            ];
+        }
+
+        $sys = self::governancePrompt() . "\n\n" .
+            "Você é um analista sênior de dados. Sua tarefa: gerar uma ANÁLISE TEXTUAL PROFUNDA E DETALHADA em HTML.\n" .
+            "Estruture em 4 níveis obrigatórios:\n" .
+            "Nível 1 — Visão Geral: total, registros, entidades únicas, período.\n" .
+            "Nível 2 — Distribuição e Concentração: quem concentra mais, top 5/10, percentual acumulado.\n" .
+            "Nível 3 — Padrões e Comportamentos: recorrência, frequência média, outliers, relação quantidade×valor.\n" .
+            "Nível 4 — Interpretação Analítica: o que os dados revelam, padrões relevantes, riscos/dependências/oportunidades.\n\n" .
+            "REGRAS:\n" .
+            "- Responda DIRETAMENTE à pergunta do usuário no primeiro parágrafo.\n" .
+            "- Use dados concretos (números, percentuais, nomes) — nunca frases genéricas.\n" .
+            "- Formate em HTML limpo (h3, p, strong, ul/li). Não use markdown.\n" .
+            "- Máximo 600 palavras. Seja denso e preciso.\n" .
+            "- Se os dados forem insuficientes para responder com confiança, declare explicitamente.";
+
+        $user = json_encode([
+            'user_question' => $userRequest,
+            'domain' => $domain,
+            'total_rows' => $totalRows,
+            'period' => $period,
+            'metric_column' => $context['main_metric'] ?? null,
+            'entity_column' => $context['main_entity'] ?? null,
+            'kpis' => $kpis,
+            'top_ranking' => $topRanking,
+            'charts_summary' => $chartSummaries,
+        ], JSON_UNESCAPED_UNICODE);
+
+        $model = (string)($llmConfig['model'] ?? 'gpt-4o-mini');
+        $resp = OpenAIClient::textCall((string)$llmConfig['api_key'], $model, $sys, $user, 0.3);
+        if (empty($resp['ok']) || empty($resp['text'])) {
+            return null;
+        }
+
+        return (string)$resp['text'];
     }
 
     private static function aiRefineCharts(array $charts, array $headers, array $types, array $profile, array $context, array $requestPlan, array $llmConfig): array

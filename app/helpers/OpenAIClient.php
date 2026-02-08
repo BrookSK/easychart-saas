@@ -44,6 +44,24 @@ class OpenAIClient
         return ['ok' => true, 'status' => $http, 'error' => null, 'raw' => $resp, 'json' => $json];
     }
 
+    public static function textCall(string $apiKey, string $model, string $system, string $user, float $temperature = 0.3): array
+    {
+        $messages = [
+            ['role' => 'system', 'content' => $system],
+            ['role' => 'user', 'content' => $user],
+        ];
+
+        $resp = self::request($apiKey, $model, $messages, $temperature);
+        if (empty($resp['ok'])) {
+            return ['ok' => false, 'error' => $resp['error'] ?? 'OpenAI request failed', 'text' => null];
+        }
+
+        $content = $resp['json']['choices'][0]['message']['content'] ?? '';
+        $content = trim((string)$content);
+
+        return ['ok' => true, 'error' => null, 'text' => $content];
+    }
+
     public static function jsonCall(string $apiKey, string $model, string $system, string $user, float $temperature = 0.2): array
     {
         $messages = [
