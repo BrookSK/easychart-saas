@@ -61,7 +61,7 @@
             <div style="font-weight:600;margin-bottom:6px;">Relatório Final</div>
             <?php
                 $rt = (string)($report['report_text'] ?? '');
-                $looksHtml = (strpos($rt, '<div') !== false) || (strpos($rt, '<strong') !== false) || (strpos($rt, '<ol') !== false);
+                $looksHtml = (strpos($rt, '<div') !== false) || (strpos($rt, '<strong') !== false) || (strpos($rt, '<ol') !== false) || (strpos($rt, '<h3') !== false) || (strpos($rt, '<p>') !== false) || (strpos($rt, '<ul') !== false) || (strpos($rt, '<h2') !== false) || (strpos($rt, '<li') !== false);
             ?>
             <?php if ($looksHtml): ?>
                 <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;">

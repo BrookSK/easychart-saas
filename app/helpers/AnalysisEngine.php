@@ -272,12 +272,30 @@ class AnalysisEngine
             $context['time_axis'] = $analyticPlan['time_axis'];
         }
 
+        // Aplicar filtros textuais derivados pela IA (ex: "motoboy" na coluna Descrição)
+        $filteredRows = $rows;
+        $appliedFilters = [];
+        $aiFilters = $requestPlan['filters'] ?? [];
+        if (is_array($aiFilters) && !empty($aiFilters)) {
+            $filteredRows = self::applyRequestFilters($cleanHeaders, $rows, $typed, $aiFilters, $appliedFilters);
+            $requestPlan['applied_filters'] = $appliedFilters;
+        }
+        // Se filtro resultou em 0 linhas, usa dados originais com flag
+        $filterActive = false;
+        if (!empty($appliedFilters) && count($filteredRows) > 0) {
+            $filterActive = true;
+        } elseif (!empty($appliedFilters) && count($filteredRows) === 0) {
+            $filteredRows = $rows;
+            $requestPlan['filter_warning'] = 'Nenhum registro encontrou correspondência com os filtros. Mostrando dados completos.';
+        }
+        $workingRows = $filterActive ? $filteredRows : $rows;
+
         // ETAPA 2: O que é relevante (insights/indicadores) para o pedido
-        $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan, $columnMap);
+        $analytics = self::buildAnalytics($cleanHeaders, $workingRows, $typed, $context, $requestPlan, $columnMap);
         $dashboardPlan = self::buildDashboardPlan($profile, $context, $analytics, $requestPlan, $columnMap);
 
         // ETAPA 3: Criação dos gráficos específicos (apenas o que faz sentido para a solicitação)
-        $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
+        $charts = self::buildCharts($cleanHeaders, $workingRows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
 
         // Refino por gráfico via IA (1 chamada por gráfico) + limite de 6 gráficos
         $maxCharts = !empty($requestPlan['wants_dashboard']) ? 6 : 3;
@@ -292,7 +310,7 @@ class AnalysisEngine
 
         // Melhoria 2: Análise textual profunda via IA (substitui relatório mecânico)
         if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
-            $aiAnalysis = self::aiGenerateAnalysis($analytics, $charts, $profile, $context, $requestPlan, $llmConfig);
+            $aiAnalysis = self::aiGenerateAnalysis($analytics, $charts, $profile, $context, $requestPlan, $llmConfig, $cleanHeaders, $workingRows, $filterActive);
             if (is_string($aiAnalysis) && trim($aiAnalysis) !== '') {
                 $reportHtml = $aiAnalysis;
             }
@@ -4350,6 +4368,146 @@ class AnalysisEngine
         return $rows;
     }
 
+    private static function applyRequestFilters(array $headers, array $rows, array $types, array $filters, array &$appliedLog): array
+    {
+        if (!is_array($filters) || empty($filters)) {
+            return $rows;
+        }
+
+        $headerIndex = [];
+        foreach ($headers as $i => $h) {
+            $headerIndex[mb_strtolower(trim((string)$h))] = (int)$i;
+            $headerIndex[trim((string)$h)] = (int)$i;
+        }
+
+        $compiled = [];
+        foreach ($filters as $f) {
+            if (!is_array($f)) {
+                continue;
+            }
+            $col = trim((string)($f['column'] ?? ''));
+            $op = mb_strtolower(trim((string)($f['op'] ?? 'contains')));
+            $val = trim((string)($f['value'] ?? ''));
+            if ($col === '' || $val === '') {
+                continue;
+            }
+
+            $idx = $headerIndex[$col] ?? ($headerIndex[mb_strtolower($col)] ?? null);
+            if ($idx === null) {
+                // Tenta match parcial no nome do header
+                foreach ($headers as $i => $h) {
+                    if (mb_stripos((string)$h, $col) !== false) {
+                        $idx = (int)$i;
+                        break;
+                    }
+                }
+            }
+            if ($idx === null) {
+                continue;
+            }
+
+            $compiled[] = [
+                'idx' => $idx,
+                'op' => $op,
+                'value' => $val,
+                'value_lower' => mb_strtolower($val),
+                'column' => $col,
+            ];
+        }
+
+        if (empty($compiled)) {
+            return $rows;
+        }
+
+        $out = [];
+        foreach ($rows as $row) {
+            $match = true;
+            foreach ($compiled as $rule) {
+                $cellRaw = isset($row[$rule['idx']]) ? trim((string)$row[$rule['idx']]) : '';
+                $cellLower = mb_strtolower($cellRaw);
+
+                switch ($rule['op']) {
+                    case 'contains':
+                    case 'like':
+                        if (mb_strpos($cellLower, $rule['value_lower']) === false) {
+                            $match = false;
+                        }
+                        break;
+                    case 'equals':
+                    case 'eq':
+                    case '=':
+                        if ($cellLower !== $rule['value_lower']) {
+                            $match = false;
+                        }
+                        break;
+                    case 'not_contains':
+                        if (mb_strpos($cellLower, $rule['value_lower']) !== false) {
+                            $match = false;
+                        }
+                        break;
+                    case 'gt':
+                    case '>':
+                        $numCell = self::parseNumber($cellRaw);
+                        $numVal = self::parseNumber($rule['value']);
+                        if ($numCell === null || $numVal === null || $numCell <= $numVal) {
+                            $match = false;
+                        }
+                        break;
+                    case 'gte':
+                    case '>=':
+                        $numCell = self::parseNumber($cellRaw);
+                        $numVal = self::parseNumber($rule['value']);
+                        if ($numCell === null || $numVal === null || $numCell < $numVal) {
+                            $match = false;
+                        }
+                        break;
+                    case 'lt':
+                    case '<':
+                        $numCell = self::parseNumber($cellRaw);
+                        $numVal = self::parseNumber($rule['value']);
+                        if ($numCell === null || $numVal === null || $numCell >= $numVal) {
+                            $match = false;
+                        }
+                        break;
+                    case 'lte':
+                    case '<=':
+                        $numCell = self::parseNumber($cellRaw);
+                        $numVal = self::parseNumber($rule['value']);
+                        if ($numCell === null || $numVal === null || $numCell > $numVal) {
+                            $match = false;
+                        }
+                        break;
+                    default:
+                        // fallback: contains
+                        if (mb_strpos($cellLower, $rule['value_lower']) === false) {
+                            $match = false;
+                        }
+                        break;
+                }
+
+                if (!$match) {
+                    break;
+                }
+            }
+            if ($match) {
+                $out[] = $row;
+            }
+        }
+
+        foreach ($compiled as $rule) {
+            $appliedLog[] = [
+                'column' => $rule['column'],
+                'column_idx' => $rule['idx'],
+                'op' => $rule['op'],
+                'value' => $rule['value'],
+                'rows_before' => count($rows),
+                'rows_after' => count($out),
+            ];
+        }
+
+        return $out;
+    }
+
     private static function aiInterpretRequest(string $userRequest, array $headers, array $types, array $profile, array $columnMap, array $llmConfig): ?array
     {
         $req = trim($userRequest);
@@ -4382,7 +4540,13 @@ class AnalysisEngine
             "Você é o motor de interpretação de perguntas do usuário sobre dados tabulares.\n" .
             "Sua tarefa: analisar a pergunta do usuário e retornar um plano analítico estruturado em JSON.\n" .
             "Considere APENAS as colunas disponíveis. Não invente colunas.\n" .
-            "Se a pergunta for vaga, escolha a interpretação mais útil e declare em 'interpretation'.\n" .
+            "Se a pergunta for vaga, escolha a interpretação mais útil e declare em 'interpretation'.\n\n" .
+            "REGRA CRÍTICA SOBRE FILTROS:\n" .
+            "Se a pergunta mencionar uma entidade específica (ex: 'motoboy', 'banco do brasil', 'aluguel', 'combustível', etc.),\n" .
+            "você DEVE gerar um filtro em 'filters' com op='contains' na coluna mais provável (Descrição, Categoria, Favorecido, etc.).\n" .
+            "Sem esse filtro, o sistema não consegue isolar os dados relevantes e a análise ficará zerada/genérica.\n" .
+            "Procure a entidade mencionada nos top_values das colunas categóricas para identificar a coluna correta.\n" .
+            "Se a entidade puder estar em mais de uma coluna, gere filtros para a mais provável.\n\n" .
             "Retorne APENAS JSON válido, sem texto fora do JSON.";
 
         $user = [
@@ -4416,11 +4580,12 @@ class AnalysisEngine
         return $resp['data'];
     }
 
-    private static function aiGenerateAnalysis(array $analytics, array $charts, array $profile, array $context, array $requestPlan, array $llmConfig): ?string
+    private static function aiGenerateAnalysis(array $analytics, array $charts, array $profile, array $context, array $requestPlan, array $llmConfig, array $headers = [], array $workingRows = [], bool $filterActive = false): ?string
     {
         $userRequest = trim((string)($requestPlan['raw'] ?? ''));
 
         $totalRows = (int)($profile['volume']['total_rows'] ?? 0);
+        $filteredCount = count($workingRows);
         $period = $profile['period'] ?? null;
         $domain = $context['domain'] ?? 'geral';
 
@@ -4444,6 +4609,19 @@ class AnalysisEngine
             $kpis['unique_entities'] = $analytics['unique_entities'];
         }
 
+        // Amostra de dados reais (filtrados) para a IA ver os dados concretos
+        $sampleData = [];
+        if (!empty($headers) && !empty($workingRows)) {
+            $sampleSlice = array_slice($workingRows, 0, 20);
+            foreach ($sampleSlice as $row) {
+                $rowAssoc = [];
+                foreach ($headers as $i => $h) {
+                    $rowAssoc[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
+                }
+                $sampleData[] = $rowAssoc;
+            }
+        }
+
         $chartSummaries = [];
         foreach (array_slice($charts, 0, 3) as $c) {
             $chartSummaries[] = [
@@ -4454,6 +4632,21 @@ class AnalysisEngine
             ];
         }
 
+        $filterNote = '';
+        if ($filterActive) {
+            $appliedFilters = $requestPlan['applied_filters'] ?? [];
+            $filterDescs = [];
+            if (is_array($appliedFilters)) {
+                foreach ($appliedFilters as $af) {
+                    $filterDescs[] = ($af['column'] ?? '?') . ' ' . ($af['op'] ?? 'contains') . ' "' . ($af['value'] ?? '') . '"';
+                }
+            }
+            $filterNote = "IMPORTANTE: Os dados foram FILTRADOS. Filtros aplicados: " . implode(', ', $filterDescs) . ". " .
+                "Total original: {$totalRows} linhas. Após filtro: {$filteredCount} linhas. " .
+                "Analise APENAS os dados filtrados que correspondem à pergunta do usuário.";
+        }
+        $filterWarning = (string)($requestPlan['filter_warning'] ?? '');
+
         $sys = self::governancePrompt() . "\n\n" .
             "Você é um analista sênior de dados. Sua tarefa: gerar uma ANÁLISE TEXTUAL PROFUNDA E DETALHADA em HTML.\n" .
             "Estruture em 4 níveis obrigatórios:\n" .
@@ -4463,22 +4656,35 @@ class AnalysisEngine
             "Nível 4 — Interpretação Analítica: o que os dados revelam, padrões relevantes, riscos/dependências/oportunidades.\n\n" .
             "REGRAS:\n" .
             "- Responda DIRETAMENTE à pergunta do usuário no primeiro parágrafo.\n" .
-            "- Use dados concretos (números, percentuais, nomes) — nunca frases genéricas.\n" .
+            "- Use dados concretos (números, percentuais, nomes) dos dados fornecidos — nunca frases genéricas.\n" .
+            "- Se uma amostra de dados reais for fornecida, USE-A para extrair valores, nomes e padrões concretos.\n" .
             "- Formate em HTML limpo (h3, p, strong, ul/li). Não use markdown.\n" .
             "- Máximo 600 palavras. Seja denso e preciso.\n" .
-            "- Se os dados forem insuficientes para responder com confiança, declare explicitamente.";
+            "- Se os dados forem insuficientes para responder com confiança, declare explicitamente.\n" .
+            ($filterNote !== '' ? "\n" . $filterNote . "\n" : '') .
+            ($filterWarning !== '' ? "\nAVISO: " . $filterWarning . "\n" : '');
 
-        $user = json_encode([
+        $userData = [
             'user_question' => $userRequest,
             'domain' => $domain,
-            'total_rows' => $totalRows,
+            'total_rows_original' => $totalRows,
+            'total_rows_filtered' => $filteredCount,
+            'filter_active' => $filterActive,
             'period' => $period,
             'metric_column' => $context['main_metric'] ?? null,
             'entity_column' => $context['main_entity'] ?? null,
             'kpis' => $kpis,
             'top_ranking' => $topRanking,
             'charts_summary' => $chartSummaries,
-        ], JSON_UNESCAPED_UNICODE);
+        ];
+        if (!empty($sampleData)) {
+            $userData['sample_data_rows'] = $sampleData;
+        }
+        if (!empty($requestPlan['ai_interpretation']['interpretation'])) {
+            $userData['ai_interpretation'] = (string)$requestPlan['ai_interpretation']['interpretation'];
+        }
+
+        $user = json_encode($userData, JSON_UNESCAPED_UNICODE);
 
         $model = (string)($llmConfig['model'] ?? 'gpt-4o-mini');
         $resp = OpenAIClient::textCall((string)$llmConfig['api_key'], $model, $sys, $user, 0.3);
