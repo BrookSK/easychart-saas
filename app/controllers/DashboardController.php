@@ -97,6 +97,10 @@ class DashboardController
                             ];
 
                             $analysisReportText = $result['report_text'] ?? null;
+                            $analysisReportHtml = $result['report_html'] ?? null;
+                            if (!empty($analysisReportHtml)) {
+                                $analysisReportText = $analysisReportHtml;
+                            }
 
                             $datasetProfileToStore = $result['dataset_profile'] ?? null;
                             if (is_array($datasetProfileToStore) && array_key_exists('sample_rows', $datasetProfileToStore)) {
@@ -113,7 +117,7 @@ class DashboardController
                                     'ic'  => json_encode($result['inferred_context'] ?? null, JSON_UNESCAPED_UNICODE),
                                     'an'  => json_encode($result['analytics'] ?? null, JSON_UNESCAPED_UNICODE),
                                     'cj'  => json_encode($chartsList, JSON_UNESCAPED_UNICODE),
-                                    'rt'  => $analysisReportText,
+                                    'rt'  => $analysisReportHtml ?: $analysisReportText,
                                 ]);
                                 $analysisReportId = (int)$pdo->lastInsertId();
                             } catch (PDOException $e) {
@@ -177,6 +181,12 @@ class DashboardController
                     }
 
                     $lastChartResponse = $aiPayload;
+                    if (isset($result) && is_array($result)) {
+                        $lastChartResponse['report_html'] = $result['report_html'] ?? null;
+                        $lastChartResponse['report_text'] = $result['report_text'] ?? null;
+                        $lastChartResponse['stages'] = $result['stages'] ?? null;
+                        $lastChartResponse['dashboard_plan'] = $result['dashboard_plan'] ?? null;
+                    }
 
                     if ($aiPayload['status'] === 'ok' && !$error) {
                         $success = 'Analysis generated successfully.';

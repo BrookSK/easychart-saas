@@ -327,9 +327,9 @@
                     <?php endif; ?>
                 </div>
                 <?php if (!empty($analysisReportText)): ?>
-                    <pre style="white-space:pre-wrap;font-size:12px;background:#111827;color:#e5e7eb;border-radius:10px;padding:10px 12px;max-width:100%;overflow:auto;">
-<?= htmlspecialchars(mb_strimwidth((string)$analysisReportText, 0, 3000, "\n...")) ?>
-                    </pre>
+                    <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;max-width:100%;overflow:auto;">
+                        <?= $analysisReportText ?>
+                    </div>
                 <?php endif; ?>
             </section>
         <?php endif; ?>

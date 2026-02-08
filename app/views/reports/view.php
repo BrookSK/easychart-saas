@@ -59,7 +59,17 @@
 
         <section class="card">
             <div style="font-weight:600;margin-bottom:6px;">Relatório Final</div>
-            <pre><?= htmlspecialchars((string)($report['report_text'] ?? '')) ?></pre>
+            <?php
+                $rt = (string)($report['report_text'] ?? '');
+                $looksHtml = (strpos($rt, '<div') !== false) || (strpos($rt, '<strong') !== false) || (strpos($rt, '<ol') !== false);
+            ?>
+            <?php if ($looksHtml): ?>
+                <div style="background:#ffffff;border:1px solid #e5e7eb;border-radius:12px;padding:12px 14px;">
+                    <?= $rt ?>
+                </div>
+            <?php else: ?>
+                <pre><?= htmlspecialchars($rt) ?></pre>
+            <?php endif; ?>
         </section>
 
         <?php if (!empty($charts)): ?>
