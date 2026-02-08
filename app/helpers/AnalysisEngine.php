@@ -4,6 +4,28 @@ require_once __DIR__ . '/OpenAIClient.php';
 
 class AnalysisEngine
 {
+    private static function governancePrompt(): string
+    {
+        return "Você é uma IA analítica especializada em interpretar qualquer tipo de planilha ou dado estruturado\n" .
+            "(CSV, XLSX, PDF extraído, dados tabulares em geral) para responder perguntas humanas com precisão máxima.\n\n" .
+            "SEU OBJETIVO PRINCIPAL NÃO É GERAR GRÁFICOS.\n" .
+            "SEU OBJETIVO PRINCIPAL É RESPONDER CORRETAMENTE À PERGUNTA DO USUÁRIO.\n\n" .
+            "1) Antes de qualquer cálculo, converta o pedido do usuário em uma pergunta analítica objetiva.\n" .
+            "Se você não conseguir formular a pergunta em uma frase clara, você NÃO deve continuar.\n\n" .
+            "2) Declare explicitamente: métrica principal, dimensão principal e quais dados são secundários (valor, tempo, categoria).\n" .
+            "Se o pedido contém 'quantos', 'frequência', 'vezes' => a métrica é COUNT.\n" .
+            "Valor monetário só é métrica principal se o usuário pedir explicitamente.\n\n" .
+            "3) Faça sanity check:\n" .
+            "- A métrica responde diretamente à pergunta? (SIM/NÃO)\n" .
+            "- A dimensão permite comparação significativa? (SIM/NÃO)\n" .
+            "- O output responderia à pergunta sem texto auxiliar? (SIM/NÃO)\n" .
+            "Se qualquer resposta for NÃO, ajuste métrica/dimensão ou faça no máximo 1 pergunta objetiva.\n\n" .
+            "4) Bloqueie análises/gráficos irrelevantes que não contribuam diretamente para responder a pergunta do usuário.\n\n" .
+            "5) Antes de qualquer gráfico, escreva uma resposta textual clara e direta.\n" .
+            "Se você não consegue responder em texto, o gráfico NÃO deve ser gerado.\n\n" .
+            "6) Cada gráfico deve ter relação 1:1 com a pergunta e explicar explicitamente por que existe e o que mostra.";
+    }
+
     public static function run(array $table, ?string $userRequest = null, array $overrides = [], array $llmConfig = []): array
     {
         $headers = $table['headers'] ?? [];
@@ -3814,7 +3836,8 @@ class AnalysisEngine
             $colProfiles = [];
         }
 
-        $sys = "Você é um analista de dados especializado em normalização de planilhas.\n" .
+        $sys = self::governancePrompt() . "\n\n" .
+            "Você é um analista de dados especializado em normalização de planilhas.\n" .
             "Retorne APENAS JSON válido. Não inclua texto fora do JSON.\n" .
             "Objetivo: propor regras conservadoras para normalizar números/moedas, datas e categorias (aliases) para melhorar parsing e consistência.\n" .
             "Não invente dados. Se não tiver confiança, não proponha regra para a coluna.";
@@ -4136,8 +4159,10 @@ class AnalysisEngine
             $labelsSmall = array_slice($labels, 0, 12);
             $valuesSmall = array_slice($values, 0, 12);
 
-            $sys = "Você é um consultor de negócios e analista de dados.\n" .
+            $sys = self::governancePrompt() . "\n\n" .
+                "Você é um consultor de negócios e analista de dados.\n" .
                 "Sua tarefa: melhorar título, descrição e um insight textual (1-2 frases) para um gráfico, alinhado ao pedido do usuário.\n" .
+                "Se o gráfico não estiver claramente alinhado ao pedido do usuário, escreva isso em caveat de forma objetiva.\n" .
                 "Retorne APENAS JSON válido.";
 
             $user = [
