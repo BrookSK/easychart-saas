@@ -44,67 +44,567 @@ class AnalysisEngine
             $cleanHeaders[$idx] = $h !== '' ? $h : 'col_' . ($idx + 1);
         }
 
-        // ETAPA 1: Perfil do dataset + mapeamento canônico de colunas + leitura do prompt
+        $hasAI = !empty($llmConfig['api_key']) && is_string($llmConfig['api_key']);
+        $userReq = trim((string)$userRequest);
+
+        // Perfil básico do dataset (sempre necessário)
         $typed = self::inferColumnTypes($cleanHeaders, $rows);
         $profile = self::buildDatasetProfile($cleanHeaders, $rows, $typed);
 
-        // Normalização assistida por IA (sempre ligada quando há api_key)
-        $normalization = null;
-        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
-            $normalization = self::aiProposeNormalization($cleanHeaders, $rows, $typed, $profile, $userRequest, $llmConfig);
-            if (!empty($normalization['plan']) && is_array($normalization['plan'])) {
-                $rows = self::applyNormalizationPlan($cleanHeaders, $rows, $normalization['plan'], $normalization);
-                // Recalcula após normalização
-                $typed = self::inferColumnTypes($cleanHeaders, $rows);
-                $profile = self::buildDatasetProfile($cleanHeaders, $rows, $typed);
+        // ===== PIPELINE IA (5 PASSOS) =====
+        if ($hasAI && $userReq !== '') {
+            return self::runAIPipeline($cleanHeaders, $rows, $typed, $profile, $userReq, $overrides, $llmConfig);
+        }
+
+        // ===== FALLBACK DETERMINÍSTICO (sem IA ou sem pergunta) =====
+        return self::runDeterministicPipeline($cleanHeaders, $rows, $typed, $profile, $userRequest, $overrides, $llmConfig);
+    }
+
+    private static function runAIPipeline(array $headers, array $rows, array $types, array $profile, string $userRequest, array $overrides, array $llmConfig): array
+    {
+        $totalRows = count($rows);
+
+        // ============================================================
+        // PASSO 1: IA lê cabeçalhos e entende a estrutura da planilha
+        // ============================================================
+        $colSummary = [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            $colSummary[] = ['index' => $i, 'name' => $h, 'type' => $t];
+        }
+
+        // ============================================================
+        // PASSO 2: IA lê e entende cada linha do documento
+        // ============================================================
+        // Amostra representativa: primeiras 30 + últimas 10 + 10 aleatórias do meio
+        $sampleRows = [];
+        $sampleSlice = array_slice($rows, 0, 30);
+        foreach ($sampleSlice as $row) {
+            $r = [];
+            foreach ($headers as $i => $h) {
+                $r[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
+            }
+            $sampleRows[] = $r;
+        }
+        if ($totalRows > 40) {
+            $tailSlice = array_slice($rows, -10);
+            foreach ($tailSlice as $row) {
+                $r = [];
+                foreach ($headers as $i => $h) {
+                    $r[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
+                }
+                $sampleRows[] = $r;
+            }
+            // 10 do meio
+            $midStart = (int)floor($totalRows * 0.4);
+            $midSlice = array_slice($rows, $midStart, 10);
+            foreach ($midSlice as $row) {
+                $r = [];
+                foreach ($headers as $i => $h) {
+                    $r[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
+                }
+                $sampleRows[] = $r;
             }
         }
 
+        // Valores únicos de colunas categóricas (até 50 por coluna)
+        $uniqueValues = [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            if ($t !== 'categorica') {
+                continue;
+            }
+            $seen = [];
+            foreach ($rows as $row) {
+                $v = trim((string)($row[$i] ?? ''));
+                if ($v !== '' && !isset($seen[$v])) {
+                    $seen[$v] = true;
+                }
+                if (count($seen) >= 50) {
+                    break;
+                }
+            }
+            if (count($seen) >= 1) {
+                $uniqueValues[(string)$h] = array_keys($seen);
+            }
+        }
+
+        // ============================================================
+        // PASSO 3: IA entende a demanda do usuário + PASSO 4: pesquisa
+        // Chamada única que recebe TUDO e retorna plano completo
+        // ============================================================
+        $model = (string)($llmConfig['model'] ?? 'gpt-4o-mini');
+        $apiKey = (string)$llmConfig['api_key'];
+
+        $sysPrompt = self::governancePrompt() . "\n\n" .
+            "Você é um analista de dados sênior. Recebeu uma planilha completa e uma pergunta do usuário.\n\n" .
+            "SEUS 5 PASSOS OBRIGATÓRIOS:\n" .
+            "1. Leia os cabeçalhos e entenda o que cada coluna representa.\n" .
+            "2. Leia as linhas de amostra e entenda os dados reais (padrões, entidades, valores).\n" .
+            "3. Entenda exatamente o que o usuário está perguntando.\n" .
+            "4. Defina como pesquisar e processar os dados para responder (filtros, agregações, colunas).\n" .
+            "5. Retorne o plano de análise em JSON.\n\n" .
+            "REGRAS CRÍTICAS:\n" .
+            "- Analise unique_values_by_column para encontrar EXATAMENTE onde a entidade mencionada pelo usuário aparece.\n" .
+            "- Se o usuário menciona 'motoboy' e existe 'Uber e Motoboy' em alguma coluna, use essa coluna no filtro.\n" .
+            "- Gere filtros com op='contains' usando o termo mais curto que capture os registros relevantes.\n" .
+            "- Identifique a coluna de VALOR (numérica com valores monetários) para somar/agregar.\n" .
+            "- Identifique a coluna de DATA para análise temporal se necessário.\n" .
+            "- NÃO assuma modelo fixo de planilha. Cada planilha é diferente.\n" .
+            "- Retorne APENAS JSON válido.";
+
+        $userData = [
+            'user_question' => $userRequest,
+            'total_rows' => $totalRows,
+            'columns' => $colSummary,
+            'sample_data_rows' => $sampleRows,
+            'unique_values_by_column' => $uniqueValues,
+            'output_schema' => [
+                'understanding' => [
+                    'spreadsheet_description' => 'string: o que esta planilha contém (1 frase)',
+                    'column_roles' => 'object: {column_name: role} onde role é: value|date|category|subcategory|description|status|id|ignore',
+                    'value_column' => 'string|null: nome da coluna principal de valores monetários/numéricos',
+                    'date_column' => 'string|null: nome da coluna de datas',
+                    'main_category_column' => 'string|null: coluna principal de categorização',
+                ],
+                'interpretation' => 'string: reformulação clara da pergunta do usuário',
+                'filters' => 'array de {column: string, op: "contains"|"equals"|"gt"|"lt", value: string}',
+                'metric_op' => 'sum|count|avg',
+                'metric_column' => 'string|null: coluna numérica para agregar',
+                'group_by' => 'string|null: coluna para agrupar resultados',
+                'time_axis' => 'string|null: coluna temporal (só se pergunta pede evolução)',
+                'time_bucket' => 'day|month|year|null',
+                'order' => 'desc|asc',
+                'limit' => 'number|null',
+                'suggested_charts' => 'array de {type: "bar"|"line"|"pie", title: string, x_column: string, y_column: string}',
+            ],
+        ];
+
+        $aiPlan = OpenAIClient::jsonCall($apiKey, $model, $sysPrompt, json_encode($userData, JSON_UNESCAPED_UNICODE), 0.1);
+        $plan = (!empty($aiPlan['ok']) && is_array($aiPlan['data'])) ? $aiPlan['data'] : [];
+
+        // Extrair entendimento da IA
+        $understanding = $plan['understanding'] ?? [];
+        $interpretation = (string)($plan['interpretation'] ?? $userRequest);
+        $filters = $plan['filters'] ?? [];
+        $metricOp = (string)($plan['metric_op'] ?? 'sum');
+        $metricCol = $plan['metric_column'] ?? null;
+        $groupBy = $plan['group_by'] ?? null;
+        $timeAxis = $plan['time_axis'] ?? null;
+        $timeBucket = $plan['time_bucket'] ?? null;
+        $order = (string)($plan['order'] ?? 'desc');
+        $limit = isset($plan['limit']) ? (int)$plan['limit'] : null;
+        $suggestedCharts = $plan['suggested_charts'] ?? [];
+
+        // Validar que colunas referenciadas existem
+        if (is_string($metricCol) && !in_array($metricCol, $headers, true)) {
+            $metricCol = null;
+        }
+        if (is_string($groupBy) && !in_array($groupBy, $headers, true)) {
+            $groupBy = null;
+        }
+        if (is_string($timeAxis) && !in_array($timeAxis, $headers, true)) {
+            $timeAxis = null;
+        }
+
+        // Auto-detectar coluna de valor se IA não encontrou
+        if ($metricCol === null && $metricOp !== 'count') {
+            foreach ($headers as $i => $h) {
+                if (($types[$i] ?? '') === 'numerica') {
+                    $metricCol = $h;
+                    break;
+                }
+            }
+        }
+
+        // ============================================================
+        // PASSO 4: Pesquisa e processamento de dados
+        // ============================================================
+
+        // Aplicar filtros
+        $workingRows = $rows;
+        $filterActive = false;
+        $appliedFilters = [];
+        if (is_array($filters) && !empty($filters)) {
+            $filteredRows = self::applyRequestFilters($headers, $rows, $types, $filters, $appliedFilters);
+            if (count($filteredRows) > 0) {
+                $workingRows = $filteredRows;
+                $filterActive = true;
+            } else {
+                // Fallback fuzzy
+                $fuzzyRows = self::fuzzyFilterFallback($headers, $rows, $types, $filters);
+                if (count($fuzzyRows) > 0) {
+                    $workingRows = $fuzzyRows;
+                    $filterActive = true;
+                }
+            }
+        }
+
+        // Processar dados: agregar por group_by
+        $metricIdx = is_string($metricCol) ? array_search($metricCol, $headers, true) : false;
+        $groupIdx = is_string($groupBy) ? array_search($groupBy, $headers, true) : false;
+        $timeIdx = is_string($timeAxis) ? array_search($timeAxis, $headers, true) : false;
+
+        $aggregated = [];
+        $totalValue = 0.0;
+        $valueCount = 0;
+        $allValues = [];
+
+        foreach ($workingRows as $row) {
+            $val = null;
+            if ($metricIdx !== false && isset($row[$metricIdx])) {
+                $val = self::parseNumber((string)$row[$metricIdx]);
+            }
+
+            if ($metricOp === 'count') {
+                $val = 1;
+            }
+
+            if ($val === null) {
+                continue;
+            }
+
+            $totalValue += (float)$val;
+            $valueCount++;
+            $allValues[] = (float)$val;
+
+            $groupKey = '__total__';
+            if ($groupIdx !== false && isset($row[$groupIdx])) {
+                $gv = trim((string)$row[$groupIdx]);
+                if ($gv !== '') {
+                    $groupKey = $gv;
+                }
+            }
+
+            if (!isset($aggregated[$groupKey])) {
+                $aggregated[$groupKey] = ['sum' => 0.0, 'count' => 0, 'values' => []];
+            }
+            $aggregated[$groupKey]['sum'] += (float)$val;
+            $aggregated[$groupKey]['count'] += 1;
+            $aggregated[$groupKey]['values'][] = (float)$val;
+        }
+
+        // Calcular resultado por grupo
+        $results = [];
+        foreach ($aggregated as $key => $data) {
+            $resultVal = 0;
+            switch ($metricOp) {
+                case 'sum':
+                    $resultVal = $data['sum'];
+                    break;
+                case 'count':
+                    $resultVal = $data['count'];
+                    break;
+                case 'avg':
+                    $resultVal = $data['count'] > 0 ? $data['sum'] / $data['count'] : 0;
+                    break;
+            }
+            $results[$key] = round($resultVal, 2);
+        }
+
+        // Ordenar
+        if ($order === 'asc') {
+            asort($results);
+        } else {
+            arsort($results);
+        }
+
+        // Aplicar limite
+        if ($limit !== null && $limit > 0) {
+            $results = array_slice($results, 0, $limit, true);
+        }
+
+        // Construir gráficos a partir dos dados agregados
+        $charts = [];
+        if (!empty($results) && !(count($results) === 1 && isset($results['__total__']))) {
+            // Gráfico de barras principal
+            $labels = array_keys($results);
+            $values = array_values($results);
+            $charts[] = [
+                'chart_type' => 'bar',
+                'type' => 'bar',
+                'title' => $interpretation,
+                'description' => ucfirst($metricOp) . ' de ' . ($metricCol ?? 'registros') . ' por ' . ($groupBy ?? 'categoria'),
+                'labels' => $labels,
+                'values' => $values,
+            ];
+
+            // Gráfico de pizza se <= 10 categorias
+            if (count($results) <= 10 && count($results) >= 2) {
+                $charts[] = [
+                    'chart_type' => 'pie',
+                    'type' => 'pie',
+                    'title' => 'Distribuição: ' . ($groupBy ?? 'categorias'),
+                    'description' => 'Participação percentual de cada grupo',
+                    'labels' => $labels,
+                    'values' => $values,
+                ];
+            }
+        }
+
+        // Série temporal se timeAxis definido
+        if ($timeIdx !== false && is_string($timeAxis)) {
+            $timeSeries = [];
+            foreach ($workingRows as $row) {
+                $dateRaw = isset($row[$timeIdx]) ? trim((string)$row[$timeIdx]) : '';
+                if ($dateRaw === '') {
+                    continue;
+                }
+                $val = 1;
+                if ($metricOp !== 'count' && $metricIdx !== false && isset($row[$metricIdx])) {
+                    $parsed = self::parseNumber((string)$row[$metricIdx]);
+                    if ($parsed !== null) {
+                        $val = (float)$parsed;
+                    } else {
+                        continue;
+                    }
+                }
+
+                $bucket = $dateRaw;
+                $ts = strtotime(str_replace('/', '-', $dateRaw));
+                if ($ts !== false) {
+                    switch ($timeBucket) {
+                        case 'year':
+                            $bucket = date('Y', $ts);
+                            break;
+                        case 'month':
+                            $bucket = date('Y-m', $ts);
+                            break;
+                        case 'day':
+                        default:
+                            $bucket = date('Y-m-d', $ts);
+                            break;
+                    }
+                }
+
+                if (!isset($timeSeries[$bucket])) {
+                    $timeSeries[$bucket] = ['sum' => 0.0, 'count' => 0];
+                }
+                $timeSeries[$bucket]['sum'] += $val;
+                $timeSeries[$bucket]['count'] += 1;
+            }
+
+            if (!empty($timeSeries)) {
+                ksort($timeSeries);
+                $tsLabels = array_keys($timeSeries);
+                $tsValues = [];
+                foreach ($timeSeries as $d) {
+                    switch ($metricOp) {
+                        case 'avg':
+                            $tsValues[] = $d['count'] > 0 ? round($d['sum'] / $d['count'], 2) : 0;
+                            break;
+                        case 'count':
+                            $tsValues[] = $d['count'];
+                            break;
+                        default:
+                            $tsValues[] = round($d['sum'], 2);
+                            break;
+                    }
+                }
+                $charts[] = [
+                    'chart_type' => 'line',
+                    'type' => 'line',
+                    'title' => 'Evolução temporal',
+                    'description' => ucfirst($metricOp) . ' de ' . ($metricCol ?? 'registros') . ' ao longo do tempo',
+                    'labels' => $tsLabels,
+                    'values' => $tsValues,
+                ];
+            }
+        }
+
+        // Usar sugestões da IA para gráficos adicionais se não temos gráficos
+        if (empty($charts) && !empty($suggestedCharts) && is_array($suggestedCharts)) {
+            foreach (array_slice($suggestedCharts, 0, 2) as $sc) {
+                if (!is_array($sc)) {
+                    continue;
+                }
+                $scType = (string)($sc['type'] ?? 'bar');
+                $scTitle = (string)($sc['title'] ?? 'Gráfico');
+                $scX = (string)($sc['x_column'] ?? '');
+                $scY = (string)($sc['y_column'] ?? '');
+                $xIdx = $scX !== '' ? array_search($scX, $headers, true) : false;
+                $yIdx = $scY !== '' ? array_search($scY, $headers, true) : false;
+                if ($xIdx === false) {
+                    continue;
+                }
+
+                $scAgg = [];
+                foreach ($workingRows as $row) {
+                    $label = trim((string)($row[$xIdx] ?? ''));
+                    if ($label === '') {
+                        continue;
+                    }
+                    $v = 1;
+                    if ($yIdx !== false && isset($row[$yIdx])) {
+                        $parsed = self::parseNumber((string)$row[$yIdx]);
+                        if ($parsed !== null) {
+                            $v = (float)$parsed;
+                        }
+                    }
+                    if (!isset($scAgg[$label])) {
+                        $scAgg[$label] = 0;
+                    }
+                    $scAgg[$label] += $v;
+                }
+                arsort($scAgg);
+                $scAgg = array_slice($scAgg, 0, 15, true);
+                if (!empty($scAgg)) {
+                    $charts[] = [
+                        'chart_type' => $scType,
+                        'type' => $scType,
+                        'title' => $scTitle,
+                        'description' => '',
+                        'labels' => array_keys($scAgg),
+                        'values' => array_values($scAgg),
+                    ];
+                }
+            }
+        }
+
+        // Limitar gráficos
+        $charts = array_slice($charts, 0, 3);
+
+        // Refinar gráficos via IA
+        $charts = self::aiRefineCharts($charts, $headers, $types, $profile, [
+            'domain' => $understanding['spreadsheet_description'] ?? 'dados',
+            'main_entity' => $groupBy,
+            'main_metric' => $metricCol,
+            'time_axis' => $timeAxis,
+        ], ['raw' => $userRequest], $llmConfig);
+
+        // ============================================================
+        // PASSO 5: Resultado da análise específica
+        // ============================================================
+
+        // Preparar dados para análise textual profunda
+        $kpis = [
+            'total_rows_original' => count($rows),
+            'total_rows_filtered' => count($workingRows),
+            'filter_active' => $filterActive,
+        ];
+        if ($metricOp === 'sum') {
+            $kpis['total_sum'] = round($totalValue, 2);
+        }
+        if ($metricOp === 'count') {
+            $kpis['total_count'] = $valueCount;
+        }
+        if ($metricOp === 'avg' && $valueCount > 0) {
+            $kpis['average'] = round($totalValue / $valueCount, 2);
+        }
+        $kpis['unique_groups'] = count($aggregated) - (isset($aggregated['__total__']) ? 1 : 0);
+
+        // Amostra de dados filtrados para a IA
+        $sampleFiltered = [];
+        foreach (array_slice($workingRows, 0, 20) as $row) {
+            $r = [];
+            foreach ($headers as $i => $h) {
+                $r[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
+            }
+            $sampleFiltered[] = $r;
+        }
+
+        // Top ranking
+        $topRanking = array_slice($results, 0, 10, true);
+
+        $analysisSys = self::governancePrompt() . "\n\n" .
+            "Você é um analista sênior de dados. Gere uma ANÁLISE TEXTUAL PROFUNDA E DETALHADA em HTML.\n" .
+            "Estruture em 4 níveis obrigatórios:\n" .
+            "Nível 1 — Visão Geral: responda DIRETAMENTE à pergunta, com o número/valor principal.\n" .
+            "Nível 2 — Distribuição e Concentração: top categorias, percentuais, concentração.\n" .
+            "Nível 3 — Padrões e Comportamentos: recorrência, outliers, relações.\n" .
+            "Nível 4 — Interpretação Analítica: o que os dados revelam, riscos, oportunidades.\n\n" .
+            "REGRAS:\n" .
+            "- Responda DIRETAMENTE à pergunta no primeiro parágrafo com dados concretos.\n" .
+            "- Use os sample_data_rows e top_ranking para extrair valores reais.\n" .
+            "- Formate em HTML limpo (h3, p, strong, ul/li). Não use markdown.\n" .
+            "- Máximo 600 palavras. Seja denso e preciso.\n" .
+            ($filterActive ? "- DADOS FILTRADOS: " . count($workingRows) . " registros de " . count($rows) . " originais.\n" : '');
+
+        $analysisData = json_encode([
+            'user_question' => $userRequest,
+            'interpretation' => $interpretation,
+            'understanding' => $understanding,
+            'kpis' => $kpis,
+            'top_ranking' => $topRanking,
+            'sample_data_rows' => $sampleFiltered,
+            'metric_op' => $metricOp,
+            'metric_column' => $metricCol,
+            'group_by' => $groupBy,
+            'filters_applied' => $appliedFilters,
+        ], JSON_UNESCAPED_UNICODE);
+
+        $analysisResp = OpenAIClient::textCall($apiKey, $model, $analysisSys, $analysisData, 0.3);
+        $reportHtml = (!empty($analysisResp['ok']) && !empty($analysisResp['text'])) ? (string)$analysisResp['text'] : '';
+
+        if ($reportHtml === '') {
+            $reportHtml = '<h3>Resultado</h3><p>Registros encontrados: ' . count($workingRows) . '</p>';
+            if (!empty($topRanking)) {
+                $reportHtml .= '<ul>';
+                foreach ($topRanking as $k => $v) {
+                    $reportHtml .= '<li><strong>' . htmlspecialchars((string)$k) . '</strong>: ' . number_format((float)$v, 2, ',', '.') . '</li>';
+                }
+                $reportHtml .= '</ul>';
+            }
+        }
+
+        $requestPlan = [
+            'raw' => $userRequest,
+            'ai_plan' => $plan,
+            'interpretation' => $interpretation,
+            'filters' => $filters,
+            'applied_filters' => $appliedFilters,
+            'metric_op' => $metricOp,
+            'metric_column' => $metricCol,
+            'group_by' => $groupBy,
+            'time_axis' => $timeAxis,
+            'filter_active' => $filterActive,
+            'intents' => ['ai_driven'],
+        ];
+
+        $context = [
+            'domain' => $understanding['spreadsheet_description'] ?? 'dados tabulares',
+            'main_entity' => $groupBy,
+            'main_metric' => $metricCol,
+            'time_axis' => $timeAxis,
+        ];
+
+        return [
+            'needs_clarification' => false,
+            'questions' => [],
+            'decision_log' => ['mode' => 'ai_pipeline', 'understanding' => $understanding, 'plan' => $plan],
+            'dataset_profile' => $profile,
+            'inferred_context' => $context,
+            'column_map' => [],
+            'request_plan' => $requestPlan,
+            'analytic_plan' => $plan,
+            'dashboard_plan' => null,
+            'analytics' => ['results' => $results, 'kpis' => $kpis],
+            'charts' => $charts,
+            'report_text' => strip_tags($reportHtml),
+            'report_html' => $reportHtml,
+            'normalization' => null,
+            'stages' => [
+                '1' => ['title' => 'IA leu cabeçalhos e estrutura', 'columns' => $colSummary, 'understanding' => $understanding],
+                '2' => ['title' => 'IA leu e entendeu os dados', 'sample_count' => count($sampleRows), 'unique_values_count' => count($uniqueValues)],
+                '3' => ['title' => 'IA entendeu a demanda', 'interpretation' => $interpretation, 'filters' => $filters],
+                '4' => ['title' => 'Pesquisa e processamento', 'rows_filtered' => count($workingRows), 'groups' => count($results)],
+                '5' => ['title' => 'Resultado da análise', 'charts_count' => count($charts)],
+            ],
+        ];
+    }
+
+    private static function runDeterministicPipeline(array $cleanHeaders, array $rows, array $typed, array $profile, ?string $userRequest, array $overrides, array $llmConfig): array
+    {
         $columnMap = self::mapColumns($cleanHeaders, $typed, $profile);
         $requestPlan = self::interpretUserRequest($cleanHeaders, $typed, $profile, $userRequest, $columnMap);
-
-        // Melhoria 1: IA interpreta a pergunta e gera plano analítico estruturado
-        $aiInterpretation = null;
-        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key']) && trim((string)$userRequest) !== '') {
-            $aiInterpretation = self::aiInterpretRequest((string)$userRequest, $cleanHeaders, $typed, $profile, $columnMap, $llmConfig);
-            if (is_array($aiInterpretation)) {
-                $requestPlan['ai_interpretation'] = $aiInterpretation;
-                // Sobrescreve heurística com resultado da IA (apenas campos não-nulos)
-                if (!empty($aiInterpretation['metric_op']) && in_array($aiInterpretation['metric_op'], ['count', 'sum', 'avg'], true)) {
-                    $requestPlan['agg'] = $aiInterpretation['metric_op'];
-                }
-                if (!empty($aiInterpretation['metric_column']) && is_string($aiInterpretation['metric_column']) && in_array($aiInterpretation['metric_column'], $cleanHeaders, true)) {
-                    $requestPlan['metric'] = $aiInterpretation['metric_column'];
-                }
-                if (!empty($aiInterpretation['group_by']) && is_string($aiInterpretation['group_by']) && in_array($aiInterpretation['group_by'], $cleanHeaders, true)) {
-                    $requestPlan['entity'] = $aiInterpretation['group_by'];
-                }
-                if (!empty($aiInterpretation['time_axis']) && is_string($aiInterpretation['time_axis']) && in_array($aiInterpretation['time_axis'], $cleanHeaders, true)) {
-                    $requestPlan['time_axis'] = $aiInterpretation['time_axis'];
-                }
-                if (!empty($aiInterpretation['intents']) && is_array($aiInterpretation['intents'])) {
-                    $requestPlan['intents'] = $aiInterpretation['intents'];
-                }
-                if (!empty($aiInterpretation['filters']) && is_array($aiInterpretation['filters'])) {
-                    $requestPlan['filters'] = $aiInterpretation['filters'];
-                }
-                if (!empty($aiInterpretation['textual_answer_hint']) && is_string($aiInterpretation['textual_answer_hint'])) {
-                    $requestPlan['textual_answer_hint'] = $aiInterpretation['textual_answer_hint'];
-                }
-            }
-        }
-
         $context = self::inferContext($cleanHeaders, $typed, $profile, $requestPlan, $columnMap);
 
-        // Overrides (respostas do usuário) podem travar colunas e evitar ambiguidades.
         if (!empty($overrides) && is_array($overrides)) {
             self::applyOverrides($cleanHeaders, $typed, $profile, $overrides, $columnMap, $requestPlan, $context);
         }
 
-        // ETAPA 4/6: Motor de consistência (score global + ambiguidades + fallbacks governados)
         $consistency = self::consistencyEngine($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context);
         self::applyAutoSelection($consistency, $columnMap, $requestPlan, $context);
-        // Recalcula após autopick para atualizar confiança global e bloqueios
         $consistency = self::consistencyEngine($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context);
         if (!empty($consistency['force_conservative'])) {
             $requestPlan['force_conservative'] = true;
@@ -113,10 +613,9 @@ class AnalysisEngine
             $requestPlan['disable_blocks'] = $consistency['disable_blocks'];
         }
 
-        // Gate de confiabilidade: se houver ambiguidade relevante, perguntamos antes de gerar gráficos.
         $clarification = self::buildClarificationQuestions($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context, $consistency);
-
         $decisionLog = self::buildDecisionLog($cleanHeaders, $typed, $profile, $columnMap, $requestPlan, $context, $clarification, $consistency);
+
         if (!empty($clarification['needs_clarification'])) {
             return [
                 'needs_clarification' => true,
@@ -132,136 +631,15 @@ class AnalysisEngine
                 'charts' => [],
                 'report_text' => null,
                 'report_html' => null,
-                'stages' => [
-                    '1' => [
-                        'title' => 'Análise do arquivo e alinhamento do objetivo',
-                        'context' => $context,
-                        'column_map' => $columnMap,
-                        'request_plan' => $requestPlan,
-                        'dataset_profile' => [
-                            'columns' => $profile['columns'] ?? [],
-                            'volume' => $profile['volume'] ?? null,
-                            'period' => $profile['period'] ?? null,
-                        ],
-                    ],
-                    'clarification' => [
-                        'title' => 'Desambiguação (necessária)',
-                        'questions' => $clarification['questions'] ?? [],
-                    ],
-                ],
+                'stages' => [],
             ];
         }
 
-        // ETAPA 8/9: Plano analítico executável + validação anti-lixo
         $analyticPlan = self::buildAnalyticPlan($cleanHeaders, $typed, $profile, $requestPlan, $context, $columnMap);
         $planValidation = self::validateAnalyticPlan($analyticPlan, $profile);
         $analyticPlan['validation'] = $planValidation;
         $requestPlan['analytic_plan'] = $analyticPlan;
 
-        $planSig = self::planSignature($analyticPlan);
-        $requestHash = md5(mb_strtolower(trim((string)($requestPlan['raw'] ?? ''))));
-        $requestPlan['plan_signature'] = $planSig;
-        $requestPlan['request_hash'] = $requestHash;
-
-        $prevRequestHash = null;
-        $prevPlanSig = null;
-        if (!empty($overrides) && is_array($overrides)) {
-            $prevRequestHash = isset($overrides['__last_request_hash']) ? trim((string)$overrides['__last_request_hash']) : null;
-            $prevPlanSig = isset($overrides['__last_plan_sig']) ? trim((string)$overrides['__last_plan_sig']) : null;
-        }
-        if ($prevRequestHash && $prevPlanSig && $prevRequestHash !== $requestHash && $prevPlanSig === $planSig) {
-            return [
-                'needs_clarification' => true,
-                'questions' => [
-                    [
-                        'id' => 'plan_intent_clarify',
-                        'type' => 'select',
-                        'label' => 'Sua pergunta mudou, mas o plano analítico ficou igual. Qual é o objetivo principal desta análise?',
-                        'why' => 'Isso evita reutilizar um pipeline padrão e garante que a análise responda exatamente sua pergunta.',
-                        'options' => ['count', 'sum', 'avg'],
-                        'default' => $analyticPlan['metric_op'] ?? null,
-                    ],
-                ],
-                'decision_log' => array_merge((array)$decisionLog, [
-                    'anti_recycle' => [
-                        'triggered' => true,
-                        'prev_request_hash' => $prevRequestHash,
-                        'prev_plan_sig' => $prevPlanSig,
-                        'current_request_hash' => $requestHash,
-                        'current_plan_sig' => $planSig,
-                    ],
-                ]),
-                'dataset_profile' => $profile,
-                'inferred_context' => $context,
-                'column_map' => $columnMap,
-                'request_plan' => $requestPlan,
-                'analytic_plan' => $analyticPlan,
-                'dashboard_plan' => null,
-                'analytics' => null,
-                'charts' => [],
-                'report_text' => null,
-                'report_html' => null,
-                'stages' => [
-                    'clarification' => [
-                        'title' => 'Desambiguação (necessária)',
-                        'questions' => [
-                            [
-                                'id' => 'plan_intent_clarify',
-                                'type' => 'select',
-                                'label' => 'Sua pergunta mudou, mas o plano analítico ficou igual. Qual é o objetivo principal desta análise?',
-                                'why' => 'Isso evita reutilizar um pipeline padrão e garante que a análise responda exatamente sua pergunta.',
-                                'options' => ['count', 'sum', 'avg'],
-                                'default' => $analyticPlan['metric_op'] ?? null,
-                            ],
-                        ],
-                    ],
-                ],
-            ];
-        }
-
-        // Fallback automático: se group_by tiver cardinalidade alta demais, degradamos o plano.
-        $issues = $planValidation['issues'] ?? [];
-        if (is_array($issues)) {
-            foreach ($issues as $it) {
-                $t = (string)($it['type'] ?? '');
-                if ($t === 'group_by_too_high_cardinality') {
-                    $analyticPlan['group_by'] = null;
-                    if (!isset($analyticPlan['validation']) || !is_array($analyticPlan['validation'])) {
-                        $analyticPlan['validation'] = [];
-                    }
-                    $analyticPlan['validation']['fallback_applied'] = 'removed_group_by_high_cardinality';
-                    $requestPlan['analytic_plan'] = $analyticPlan;
-
-                    $requestPlan['force_conservative'] = true;
-                    if (!isset($requestPlan['disable_blocks']) || !is_array($requestPlan['disable_blocks'])) {
-                        $requestPlan['disable_blocks'] = [];
-                    }
-                    $requestPlan['disable_blocks']['time_series'] = true;
-                    $requestPlan['disable_blocks']['forecast'] = true;
-                    $requestPlan['disable_blocks']['finance'] = true;
-                    $requestPlan['disable_blocks']['gantt'] = true;
-                    break;
-                }
-            }
-        }
-
-        // Governança anti-lixo: se o plano não é executável com segurança, degradamos automaticamente.
-        if (empty($planValidation['ok'])) {
-            $requestPlan['force_conservative'] = true;
-            if (!isset($requestPlan['disable_blocks']) || !is_array($requestPlan['disable_blocks'])) {
-                $requestPlan['disable_blocks'] = [];
-            }
-            $requestPlan['disable_blocks']['time_series'] = true;
-            $requestPlan['disable_blocks']['forecast'] = true;
-            $requestPlan['disable_blocks']['finance'] = true;
-            $requestPlan['disable_blocks']['gantt'] = true;
-        }
-        if (!empty($analyticPlan['metric_op'])) {
-            $requestPlan['agg'] = $analyticPlan['metric_op'];
-        }
-        if (!empty($analyticPlan['limit'])) {
-            $requestPlan['limit'] = (int)$analyticPlan['limit'];
-        }
         if (!empty($analyticPlan['group_by'])) {
             $context['main_entity'] = $analyticPlan['group_by'];
         }
@@ -272,49 +650,13 @@ class AnalysisEngine
             $context['time_axis'] = $analyticPlan['time_axis'];
         }
 
-        // Aplicar filtros textuais derivados pela IA (ex: "motoboy" na coluna Descrição)
-        $filteredRows = $rows;
-        $appliedFilters = [];
-        $aiFilters = $requestPlan['filters'] ?? [];
-        if (is_array($aiFilters) && !empty($aiFilters)) {
-            $filteredRows = self::applyRequestFilters($cleanHeaders, $rows, $typed, $aiFilters, $appliedFilters);
-            $requestPlan['applied_filters'] = $appliedFilters;
-        }
-        // Se filtro resultou em 0 linhas, usa dados originais com flag
-        $filterActive = false;
-        if (!empty($appliedFilters) && count($filteredRows) > 0) {
-            $filterActive = true;
-        } elseif (!empty($appliedFilters) && count($filteredRows) === 0) {
-            $filteredRows = $rows;
-            $requestPlan['filter_warning'] = 'Nenhum registro encontrou correspondência com os filtros. Mostrando dados completos.';
-        }
-        $workingRows = $filterActive ? $filteredRows : $rows;
-
-        // ETAPA 2: O que é relevante (insights/indicadores) para o pedido
-        $analytics = self::buildAnalytics($cleanHeaders, $workingRows, $typed, $context, $requestPlan, $columnMap);
+        $analytics = self::buildAnalytics($cleanHeaders, $rows, $typed, $context, $requestPlan, $columnMap);
         $dashboardPlan = self::buildDashboardPlan($profile, $context, $analytics, $requestPlan, $columnMap);
+        $charts = self::buildCharts($cleanHeaders, $rows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
+        $charts = array_slice($charts, 0, 3);
 
-        // ETAPA 3: Criação dos gráficos específicos (apenas o que faz sentido para a solicitação)
-        $charts = self::buildCharts($cleanHeaders, $workingRows, $typed, $context, $analytics, $requestPlan, $dashboardPlan, $columnMap);
-
-        // Refino por gráfico via IA (1 chamada por gráfico) + limite de 6 gráficos
-        $maxCharts = !empty($requestPlan['wants_dashboard']) ? 6 : 3;
-        $charts = array_slice($charts, 0, $maxCharts);
-        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
-            $charts = self::aiRefineCharts($charts, $cleanHeaders, $typed, $profile, $context, $requestPlan, $llmConfig);
-        }
-
-        // ETAPA 4: Relatório final — IA gera análise textual profunda (4 níveis)
         $reportHtml = self::buildReportHtml($profile, $context, $analytics, $charts, $dashboardPlan, $userRequest);
         $reportText = self::buildReport($profile, $context, $analytics, $charts);
-
-        // Melhoria 2: Análise textual profunda via IA (substitui relatório mecânico)
-        if (!empty($llmConfig['api_key']) && is_string($llmConfig['api_key'])) {
-            $aiAnalysis = self::aiGenerateAnalysis($analytics, $charts, $profile, $context, $requestPlan, $llmConfig, $cleanHeaders, $workingRows, $filterActive);
-            if (is_string($aiAnalysis) && trim($aiAnalysis) !== '') {
-                $reportHtml = $aiAnalysis;
-            }
-        }
 
         return [
             'needs_clarification' => false,
@@ -330,36 +672,8 @@ class AnalysisEngine
             'charts' => $charts,
             'report_text' => $reportText,
             'report_html' => $reportHtml,
-            'normalization' => $normalization,
-            'stages' => [
-                '1' => [
-                    'title' => 'Análise do arquivo e alinhamento do objetivo',
-                    'context' => $context,
-                    'column_map' => $columnMap,
-                    'request_plan' => $requestPlan,
-                    'dataset_profile' => [
-                        'columns' => $profile['columns'] ?? [],
-                        'volume' => $profile['volume'] ?? null,
-                        'period' => $profile['period'] ?? null,
-                    ],
-                ],
-                '2' => [
-                    'title' => 'Seleção de informações relevantes e recomendações',
-                    'dashboard_plan' => $dashboardPlan,
-                ],
-                'plan' => [
-                    'title' => 'Plano analítico (executável) + validação',
-                    'analytic_plan' => $analyticPlan,
-                ],
-                '3' => [
-                    'title' => 'Criação dos gráficos específicos',
-                    'charts' => $charts,
-                ],
-                '4' => [
-                    'title' => 'Relatório final',
-                    'report_html' => $reportHtml,
-                ],
-            ],
+            'normalization' => null,
+            'stages' => [],
         ];
     }
 
@@ -4368,6 +4682,83 @@ class AnalysisEngine
         return $rows;
     }
 
+    private static function fuzzyFilterFallback(array $headers, array $rows, array $types, array $filters): array
+    {
+        // Extrair todos os termos de busca dos filtros
+        $searchTerms = [];
+        foreach ($filters as $f) {
+            if (!is_array($f)) {
+                continue;
+            }
+            $val = trim((string)($f['value'] ?? ''));
+            if ($val === '') {
+                continue;
+            }
+            $valLower = mb_strtolower($val);
+            $searchTerms[] = $valLower;
+
+            // Gerar radicais: palavras individuais >= 3 chars
+            $words = preg_split('/[\s\-_\/]+/u', $valLower);
+            if (is_array($words)) {
+                foreach ($words as $w) {
+                    $w = trim($w);
+                    if (mb_strlen($w) >= 3 && !in_array($w, $searchTerms, true)) {
+                        $searchTerms[] = $w;
+                    }
+                }
+            }
+
+            // Radical mais curto: primeiros 4 chars se a palavra tem >= 5
+            if (mb_strlen($valLower) >= 5) {
+                $radical = mb_substr($valLower, 0, 4);
+                if (!in_array($radical, $searchTerms, true)) {
+                    $searchTerms[] = $radical;
+                }
+            }
+        }
+
+        if (empty($searchTerms)) {
+            return [];
+        }
+
+        // Identificar todas as colunas textuais
+        $textCols = [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            if ($t === 'categorica') {
+                $textCols[] = (int)$i;
+            }
+        }
+
+        if (empty($textCols)) {
+            return [];
+        }
+
+        // Buscar em todas as colunas textuais por qualquer um dos termos
+        $out = [];
+        foreach ($rows as $row) {
+            $found = false;
+            foreach ($textCols as $colIdx) {
+                $cellRaw = isset($row[$colIdx]) ? trim((string)$row[$colIdx]) : '';
+                if ($cellRaw === '') {
+                    continue;
+                }
+                $cellLower = mb_strtolower($cellRaw);
+                foreach ($searchTerms as $term) {
+                    if (mb_strpos($cellLower, $term) !== false) {
+                        $found = true;
+                        break 2;
+                    }
+                }
+            }
+            if ($found) {
+                $out[] = $row;
+            }
+        }
+
+        return $out;
+    }
+
     private static function applyRequestFilters(array $headers, array $rows, array $types, array $filters, array &$appliedLog): array
     {
         if (!is_array($filters) || empty($filters)) {
@@ -4508,7 +4899,7 @@ class AnalysisEngine
         return $out;
     }
 
-    private static function aiInterpretRequest(string $userRequest, array $headers, array $types, array $profile, array $columnMap, array $llmConfig): ?array
+    private static function aiInterpretRequest(string $userRequest, array $headers, array $types, array $profile, array $columnMap, array $llmConfig, array $rows = []): ?array
     {
         $req = trim($userRequest);
         if ($req === '') {
@@ -4530,10 +4921,45 @@ class AnalysisEngine
                 $entry['unique_ratio'] = round((float)($cp['unique_ratio'] ?? 0), 2);
                 $top = $cp['top_values'] ?? [];
                 if (is_array($top)) {
-                    $entry['top_values'] = array_slice($top, 0, 5);
+                    $entry['top_values'] = array_slice($top, 0, 8);
                 }
             }
             $colSummary[] = $entry;
+        }
+
+        // Amostra de linhas reais para a IA ver os dados concretos
+        $sampleRows = [];
+        if (!empty($rows)) {
+            $sampleSlice = array_slice($rows, 0, 15);
+            foreach ($sampleSlice as $row) {
+                $rowAssoc = [];
+                foreach ($headers as $i => $h) {
+                    $rowAssoc[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
+                }
+                $sampleRows[] = $rowAssoc;
+            }
+        }
+
+        // Valores únicos de colunas categóricas (até 40 por coluna) para a IA saber quais entidades existem
+        $uniqueValuesByCol = [];
+        foreach ($headers as $i => $h) {
+            $t = $types[$i] ?? 'categorica';
+            if ($t !== 'categorica') {
+                continue;
+            }
+            $seen = [];
+            foreach ($rows as $row) {
+                $v = trim((string)($row[$i] ?? ''));
+                if ($v !== '' && !isset($seen[$v])) {
+                    $seen[$v] = true;
+                }
+                if (count($seen) >= 40) {
+                    break;
+                }
+            }
+            if (count($seen) >= 2) {
+                $uniqueValuesByCol[(string)$h] = array_keys($seen);
+            }
         }
 
         $sys = self::governancePrompt() . "\n\n" .
@@ -4545,13 +4971,21 @@ class AnalysisEngine
             "Se a pergunta mencionar uma entidade específica (ex: 'motoboy', 'banco do brasil', 'aluguel', 'combustível', etc.),\n" .
             "você DEVE gerar um filtro em 'filters' com op='contains' na coluna mais provável (Descrição, Categoria, Favorecido, etc.).\n" .
             "Sem esse filtro, o sistema não consegue isolar os dados relevantes e a análise ficará zerada/genérica.\n" .
-            "Procure a entidade mencionada nos top_values das colunas categóricas para identificar a coluna correta.\n" .
+            "IMPORTANTE: Analise unique_values_by_column para ver TODOS os valores reais que existem em cada coluna categórica.\n" .
+            "Procure nessa lista qual valor contém a entidade mencionada pelo usuário.\n" .
+            "Exemplo: se o usuário pergunta sobre 'motoboy' e unique_values_by_column mostra 'Uber e Motoboy' na coluna Descrição,\n" .
+            "gere filter: {column: 'Descrição', op: 'contains', value: 'motoboy'}.\n" .
+            "Use o RADICAL ou PARTE da palavra como valor do filtro para capturar variações.\n" .
+            "Exemplo: para 'banco do brasil', use value='banco do brasil' ou value='banco brasil'.\n" .
+            "Analise também sample_data_rows para ver como os dados reais estão escritos.\n" .
             "Se a entidade puder estar em mais de uma coluna, gere filtros para a mais provável.\n\n" .
             "Retorne APENAS JSON válido, sem texto fora do JSON.";
 
         $user = [
             'user_question' => $req,
             'available_columns' => $colSummary,
+            'sample_data_rows' => $sampleRows,
+            'unique_values_by_column' => $uniqueValuesByCol,
             'current_mapping' => [
                 'amount' => $columnMap['amount']['column'] ?? null,
                 'date' => $columnMap['date']['column'] ?? null,
