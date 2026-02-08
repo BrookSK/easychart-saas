@@ -536,17 +536,39 @@ $fmtBRL = function($v) {
                     <?php if (!empty($analysisKpis)): ?>
                         <?php if (isset($analysisKpis['total_rows_filtered'])): ?>
                         <div class="tech-item">
-                            <div class="tech-item-label">Registros Processados</div>
+                            <div class="tech-item-label">Registros na Análise IA</div>
                             <div class="tech-item-value"><?= number_format((int)$analysisKpis['total_rows_filtered'], 0, ',', '.') ?></div>
                             <div class="tech-item-sub">de <?= number_format((int)($analysisKpis['total_rows_original'] ?? 0), 0, ',', '.') ?> originais</div>
                         </div>
                         <?php endif; ?>
-                        <?php if (isset($analysisKpis['unique_groups'])): ?>
+                        <div class="tech-item">
+                            <div class="tech-item-label">Total na Planilha</div>
+                            <div class="tech-item-value"><?= number_format(count($dataRows ?? []), 0, ',', '.') ?></div>
+                            <div class="tech-item-sub">registros completos disponíveis abaixo</div>
+                        </div>
+                        <?php if (isset($analysisKpis['unique_groups']) && (int)$analysisKpis['unique_groups'] > 0): ?>
                         <div class="tech-item">
                             <div class="tech-item-label">Grupos Únicos</div>
                             <div class="tech-item-value"><?= (int)$analysisKpis['unique_groups'] ?></div>
                         </div>
                         <?php endif; ?>
+                    <?php endif; ?>
+                    <?php
+                    // Aviso quando a IA filtrou um subconjunto
+                    $filteredCount = (int)($analysisKpis['total_rows_filtered'] ?? 0);
+                    $originalCount = (int)($analysisKpis['total_rows_original'] ?? 0);
+                    if ($filteredCount > 0 && $originalCount > 0 && $filteredCount < $originalCount):
+                    ?>
+                    <div class="tech-item" style="grid-column:1/-1;background:#fef3c7;border-color:#fbbf24;">
+                        <div class="tech-item-label" style="color:#92400e;">Aviso: Análise Parcial</div>
+                        <div class="tech-item-value" style="font-size:13px;font-weight:500;color:#78350f;">
+                            A IA analisou <?= number_format($filteredCount, 0, ',', '.') ?> de <?= number_format($originalCount, 0, ',', '.') ?> registros
+                            porque aplicou filtros baseados na sua pergunta.
+                            Os <strong><?= number_format(count($dataRows ?? []), 0, ',', '.') ?> registros completos</strong> da planilha estão disponíveis
+                            na seção "Explorador de Dados" abaixo.
+                            Para analisar todos os dados, faça uma pergunta mais abrangente (ex: "analise todos os dados da planilha").
+                        </div>
+                    </div>
                     <?php endif; ?>
                 </div>
 
@@ -675,17 +697,23 @@ $fmtBRL = function($v) {
         </div>
         <?php endif; ?>
 
-        <!-- ===== TABELA DE DADOS COMPLETA ===== -->
+        <!-- ===== TABELA DE DADOS COMPLETA (paginação virtual) ===== -->
         <?php if (!empty($dataHeaders) && !empty($dataRows)): ?>
-        <div class="section-title">Dados Completos da Planilha (<?= count($dataRows) ?> registros)</div>
+        <div class="section-title">Dados Completos da Planilha (<?= number_format(count($dataRows), 0, ',', '.') ?> registros)</div>
         <div class="card">
             <div class="card-head">
                 <div>
                     <div class="card-head-title">Explorador de Dados</div>
-                    <div class="card-head-sub"><?= count($dataRows) ?> registros &bull; <?= count($dataHeaders) ?> colunas &bull; Use os filtros para refinar</div>
+                    <div class="card-head-sub"><?= number_format(count($dataRows), 0, ',', '.') ?> registros &bull; <?= count($dataHeaders) ?> colunas &bull; Todos os dados da planilha</div>
                 </div>
                 <div style="display:flex;gap:8px;align-items:center;">
-                    <input type="text" id="globalSearch" class="input" style="width:220px;padding:6px 10px;font-size:12px;" placeholder="Buscar em todos os campos..." oninput="applyDataFilters()">
+                    <input type="text" id="globalSearch" class="input" style="width:220px;padding:6px 10px;font-size:12px;" placeholder="Buscar em todos os campos..." oninput="debouncedFilter()">
+                    <select id="perPageSelect" class="select" style="padding:4px 8px;font-size:12px;width:auto;" onchange="DT.perPage=parseInt(this.value);DT.page=0;DT.render();">
+                        <option value="50">50/pág</option>
+                        <option value="100" selected>100/pág</option>
+                        <option value="250">250/pág</option>
+                        <option value="500">500/pág</option>
+                    </select>
                     <button class="btn btn-secondary" style="padding:6px 12px;font-size:12px;" onclick="resetDataFilters()">Limpar</button>
                     <button class="btn btn-primary" style="padding:6px 12px;font-size:12px;" onclick="exportCSV()">Exportar CSV</button>
                 </div>
@@ -707,30 +735,26 @@ $fmtBRL = function($v) {
             </div>
             <?php endif; ?>
 
-            <div class="card-body-flush" style="max-height:600px;overflow:auto;">
+            <div class="card-body-flush" style="max-height:600px;overflow:auto;" id="dataTableWrap">
                 <table class="detail-table" id="dataTable">
                     <thead>
                         <tr>
                             <th class="rank">#</th>
                             <?php foreach ($dataHeaders as $dhi => $dh): ?>
-                                <th style="cursor:pointer;white-space:nowrap;" onclick="sortTable('dataTable',<?= $dhi + 1 ?>)"><?= htmlspecialchars(mb_strlen($dh) > 25 ? mb_substr($dh, 0, 25) . '..' : $dh) ?> &udarr;</th>
+                                <th style="cursor:pointer;white-space:nowrap;" onclick="DT.sort(<?= $dhi ?>)"><?= htmlspecialchars(mb_strlen($dh) > 25 ? mb_substr($dh, 0, 25) . '..' : $dh) ?> &udarr;</th>
                             <?php endforeach; ?>
                         </tr>
                     </thead>
-                    <tbody>
-                        <?php foreach ($dataRows as $ri => $row): ?>
-                        <tr>
-                            <td class="rank"><?= $ri + 1 ?></td>
-                            <?php foreach ($dataHeaders as $ci => $ch): ?>
-                                <td style="white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;" title="<?= htmlspecialchars((string)($row[$ci] ?? '')) ?>"><?= htmlspecialchars((string)($row[$ci] ?? '')) ?></td>
-                            <?php endforeach; ?>
-                        </tr>
-                        <?php endforeach; ?>
-                    </tbody>
+                    <tbody id="dataTableBody"></tbody>
                 </table>
             </div>
-            <div style="padding:10px 20px;border-top:1px solid #f1f5f9;font-size:12px;color:#64748b;">
-                <span id="dataTableInfo">Mostrando <?= count($dataRows) ?> registros</span>
+            <div style="padding:10px 20px;border-top:1px solid #f1f5f9;display:flex;justify-content:space-between;align-items:center;">
+                <span id="dataTableInfo" style="font-size:12px;color:#64748b;"></span>
+                <div style="display:flex;gap:6px;align-items:center;">
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px;" onclick="DT.page=Math.max(0,DT.page-1);DT.render();">&larr; Anterior</button>
+                    <span id="dataTablePageInfo" style="font-size:12px;color:#64748b;padding:4px 8px;"></span>
+                    <button class="btn btn-secondary" style="padding:4px 10px;font-size:11px;" onclick="DT.page=Math.min(DT.totalPages()-1,DT.page+1);DT.render();">Próxima &rarr;</button>
+                </div>
             </div>
         </div>
         <?php endif; ?>
@@ -843,73 +867,164 @@ $fmtBRL = function($v) {
         }
 
         <?php if (!empty($dataHeaders) && !empty($dataRows)): ?>
-        var _dataHeaders = <?= json_encode(array_values($dataHeaders), JSON_UNESCAPED_UNICODE) ?>;
+        // ===== VIRTUAL PAGINATION DATA TABLE =====
+        var DT = {
+            headers: <?= json_encode(array_values($dataHeaders), JSON_UNESCAPED_UNICODE) ?>,
+            allData: <?= json_encode(array_values($dataRows), JSON_UNESCAPED_UNICODE) ?>,
+            filtered: null,
+            page: 0,
+            perPage: 100,
+            sortCol: -1,
+            sortDir: 'asc',
 
-        function applyDataFilters(){
-            var table = document.getElementById('dataTable');
-            if(!table) return;
-            var tbody = table.querySelector('tbody');
-            var rows = Array.from(tbody.querySelectorAll('tr'));
-            var searchEl = document.getElementById('globalSearch');
-            var search = searchEl ? searchEl.value.toLowerCase() : '';
-            var selects = document.querySelectorAll('.dataFilter');
-            var colFilters = {};
-            selects.forEach(function(s){
-                var col = s.getAttribute('data-col');
-                var val = s.value;
-                if(val) colFilters[col] = val.toLowerCase();
-            });
-            var visCount = 0;
-            rows.forEach(function(r){
-                var cells = r.querySelectorAll('td');
-                var show = true;
-                if(search){
-                    var rowText = '';
-                    cells.forEach(function(c){ rowText += c.textContent.toLowerCase()+' '; });
-                    if(rowText.indexOf(search) === -1) show = false;
+            totalPages: function(){
+                var data = this.filtered || this.allData;
+                return Math.max(1, Math.ceil(data.length / this.perPage));
+            },
+
+            getFilters: function(){
+                var searchEl = document.getElementById('globalSearch');
+                var search = searchEl ? searchEl.value.toLowerCase().trim() : '';
+                var selects = document.querySelectorAll('.dataFilter');
+                var colFilters = {};
+                selects.forEach(function(s){
+                    var col = s.getAttribute('data-col');
+                    var val = s.value;
+                    if(val) colFilters[col] = val.toLowerCase();
+                });
+                return {search: search, colFilters: colFilters};
+            },
+
+            applyFilters: function(){
+                var f = this.getFilters();
+                var hasFilter = f.search !== '' || Object.keys(f.colFilters).length > 0;
+                if(!hasFilter){
+                    this.filtered = null;
+                    this.page = 0;
+                    this.render();
+                    return;
                 }
-                if(show){
-                    for(var col in colFilters){
-                        var ci = _dataHeaders.indexOf(col);
-                        if(ci >= 0 && cells[ci+1]){
-                            if(cells[ci+1].textContent.trim().toLowerCase() !== colFilters[col]) show = false;
+                var headers = this.headers;
+                var result = [];
+                for(var i = 0; i < this.allData.length; i++){
+                    var row = this.allData[i];
+                    var show = true;
+                    if(f.search){
+                        var rowText = '';
+                        for(var c = 0; c < row.length; c++){
+                            rowText += String(row[c] || '').toLowerCase() + ' ';
+                        }
+                        if(rowText.indexOf(f.search) === -1) show = false;
+                    }
+                    if(show){
+                        for(var col in f.colFilters){
+                            var ci = headers.indexOf(col);
+                            if(ci >= 0){
+                                if(String(row[ci] || '').trim().toLowerCase() !== f.colFilters[col]) show = false;
+                            }
                         }
                     }
+                    if(show) result.push(row);
                 }
-                r.style.display = show ? '' : 'none';
-                if(show) visCount++;
-            });
-            var info = document.getElementById('dataTableInfo');
-            if(info) info.textContent = 'Mostrando ' + visCount + ' de ' + rows.length + ' registros';
-        }
+                this.filtered = result;
+                this.page = 0;
+                this.render();
+            },
 
+            sort: function(colIdx){
+                if(this.sortCol === colIdx){
+                    this.sortDir = this.sortDir === 'asc' ? 'desc' : 'asc';
+                } else {
+                    this.sortCol = colIdx;
+                    this.sortDir = 'asc';
+                }
+                var dir = this.sortDir;
+                var data = this.filtered || this.allData;
+                data.sort(function(a,b){
+                    var av = String(a[colIdx] || '').trim();
+                    var bv = String(b[colIdx] || '').trim();
+                    var an = parseFloat(av.replace(/\./g,'').replace(',','.').replace('%','').replace('R$','').trim());
+                    var bn = parseFloat(bv.replace(/\./g,'').replace(',','.').replace('%','').replace('R$','').trim());
+                    if(!isNaN(an) && !isNaN(bn)) return dir==='asc' ? an-bn : bn-an;
+                    return dir==='asc' ? av.localeCompare(bv) : bv.localeCompare(av);
+                });
+                this.page = 0;
+                this.render();
+            },
+
+            render: function(){
+                var data = this.filtered || this.allData;
+                var total = data.length;
+                var totalAll = this.allData.length;
+                var start = this.page * this.perPage;
+                var end = Math.min(start + this.perPage, total);
+                var tbody = document.getElementById('dataTableBody');
+                if(!tbody) return;
+
+                var html = '';
+                for(var i = start; i < end; i++){
+                    var row = data[i];
+                    html += '<tr><td class="rank">' + (i+1) + '</td>';
+                    for(var c = 0; c < row.length; c++){
+                        var val = String(row[c] || '');
+                        var escaped = val.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+                        html += '<td style="white-space:nowrap;max-width:220px;overflow:hidden;text-overflow:ellipsis;" title="' + escaped + '">' + escaped + '</td>';
+                    }
+                    html += '</tr>';
+                }
+                tbody.innerHTML = html;
+
+                var info = document.getElementById('dataTableInfo');
+                if(info){
+                    if(this.filtered){
+                        info.textContent = 'Mostrando ' + (end - start) + ' de ' + total.toLocaleString('pt-BR') + ' filtrados (total: ' + totalAll.toLocaleString('pt-BR') + ')';
+                    } else {
+                        info.textContent = 'Mostrando ' + (start+1).toLocaleString('pt-BR') + '-' + end.toLocaleString('pt-BR') + ' de ' + total.toLocaleString('pt-BR') + ' registros';
+                    }
+                }
+                var pageInfo = document.getElementById('dataTablePageInfo');
+                if(pageInfo){
+                    pageInfo.textContent = 'Página ' + (this.page+1) + ' de ' + this.totalPages();
+                }
+            }
+        };
+
+        // Debounce para busca
+        var _filterTimer = null;
+        function debouncedFilter(){
+            clearTimeout(_filterTimer);
+            _filterTimer = setTimeout(function(){ DT.applyFilters(); }, 300);
+        }
+        function applyDataFilters(){ DT.applyFilters(); }
         function resetDataFilters(){
             var s = document.getElementById('globalSearch');
             if(s) s.value = '';
             document.querySelectorAll('.dataFilter').forEach(function(s){ s.value = ''; });
-            applyDataFilters();
+            DT.filtered = null;
+            DT.page = 0;
+            DT.render();
         }
 
         function exportCSV(){
-            var table = document.getElementById('dataTable');
-            if(!table) return;
-            var rows = table.querySelectorAll('tr');
+            var data = DT.filtered || DT.allData;
             var csv = [];
-            rows.forEach(function(r){
-                if(r.style.display === 'none') return;
+            csv.push(DT.headers.map(function(h){ return '"' + h.replace(/"/g,'""') + '"'; }).join(';'));
+            for(var i = 0; i < data.length; i++){
                 var cols = [];
-                r.querySelectorAll('th,td').forEach(function(c,i){
-                    if(i === 0) return;
-                    cols.push('"' + c.textContent.replace(/"/g,'""') + '"');
-                });
+                for(var c = 0; c < data[i].length; c++){
+                    cols.push('"' + String(data[i][c] || '').replace(/"/g,'""') + '"');
+                }
                 csv.push(cols.join(';'));
-            });
+            }
             var blob = new Blob(['\uFEFF' + csv.join('\n')], {type:'text/csv;charset=utf-8;'});
             var link = document.createElement('a');
             link.href = URL.createObjectURL(blob);
-            link.download = 'dados_analise.csv';
+            link.download = 'dados_analise_' + data.length + '_registros.csv';
             link.click();
         }
+
+        // Renderizar primeira página ao carregar
+        DT.render();
         <?php endif; ?>
         </script>
 

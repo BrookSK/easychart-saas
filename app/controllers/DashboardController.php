@@ -145,11 +145,9 @@ class DashboardController
                             $result = AnalysisEngine::run($ing['table'], $prompt, $overrides, $llmConfig);
                             $analysisResult = $result;
 
-                            // Passar dados completos para a view (headers + rows filtradas)
+                            // Passar dados completos para a view (headers + TODAS as rows)
                             $dataHeaders = $ing['table']['headers'] ?? [];
-                            $allRows = $ing['table']['rows'] ?? [];
-                            // Limitar rows para a view (máx 500 para performance)
-                            $dataRows = array_slice($allRows, 0, 500);
+                            $dataRows = $ing['table']['rows'] ?? [];
                             $dataKpis = $result['analytics']['kpis'] ?? [];
 
                             $decisionLog = $result['decision_log'] ?? null;
