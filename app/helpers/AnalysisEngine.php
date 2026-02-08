@@ -316,10 +316,15 @@ class AnalysisEngine
 
         // Construir gráficos a partir dos dados agregados
         $charts = [];
-        if (!empty($results) && !(count($results) === 1 && isset($results['__total__']))) {
-            // Gráfico de barras principal
-            $labels = array_keys($results);
-            $values = array_values($results);
+        $displayResults = $results;
+        // Remover __total__ dos resultados de exibição se houver outros grupos
+        if (count($displayResults) > 1 && isset($displayResults['__total__'])) {
+            unset($displayResults['__total__']);
+        }
+
+        if (!empty($displayResults) && !(count($displayResults) === 1 && isset($displayResults['__total__']))) {
+            $labels = array_keys($displayResults);
+            $values = array_values($displayResults);
             $charts[] = [
                 'chart_type' => 'bar',
                 'type' => 'bar',
@@ -329,8 +334,7 @@ class AnalysisEngine
                 'values' => $values,
             ];
 
-            // Gráfico de pizza se <= 10 categorias
-            if (count($results) <= 10 && count($results) >= 2) {
+            if (count($displayResults) <= 10 && count($displayResults) >= 2) {
                 $charts[] = [
                     'chart_type' => 'pie',
                     'type' => 'pie',
@@ -339,6 +343,45 @@ class AnalysisEngine
                     'labels' => $labels,
                     'values' => $values,
                 ];
+            }
+        }
+
+        // Fallback: se não temos group_by mas temos dados filtrados, agrupar por primeira coluna categórica disponível
+        if (empty($charts) && !empty($workingRows) && $groupIdx === false) {
+            $fallbackGroupIdx = false;
+            foreach ($headers as $fi => $fh) {
+                if (($types[$fi] ?? '') === 'categorica' && $fi !== $metricIdx) {
+                    $fallbackGroupIdx = $fi;
+                    break;
+                }
+            }
+            if ($fallbackGroupIdx !== false) {
+                $fbAgg = [];
+                foreach ($workingRows as $row) {
+                    $lbl = trim((string)($row[$fallbackGroupIdx] ?? ''));
+                    if ($lbl === '') continue;
+                    $v = 1;
+                    if ($metricIdx !== false && isset($row[$metricIdx])) {
+                        $parsed = self::parseNumber((string)$row[$metricIdx]);
+                        if ($parsed !== null) $v = (float)$parsed;
+                    }
+                    if (!isset($fbAgg[$lbl])) $fbAgg[$lbl] = 0;
+                    $fbAgg[$lbl] += $v;
+                }
+                arsort($fbAgg);
+                $fbAgg = array_slice($fbAgg, 0, 20, true);
+                if (count($fbAgg) >= 2) {
+                    $charts[] = [
+                        'chart_type' => 'bar',
+                        'type' => 'bar',
+                        'title' => $interpretation,
+                        'description' => ucfirst($metricOp) . ' por ' . $headers[$fallbackGroupIdx],
+                        'labels' => array_keys($fbAgg),
+                        'values' => array_values($fbAgg),
+                    ];
+                    // Atualizar results para segmentação
+                    $results = $fbAgg;
+                }
             }
         }
 
@@ -493,9 +536,30 @@ class AnalysisEngine
         }
         $kpis['unique_groups'] = count($aggregated) - (isset($aggregated['__total__']) ? 1 : 0);
 
-        // Amostra de dados filtrados para a IA
+        // Estatísticas adicionais para análise mais rica
+        if ($metricIdx !== false && !empty($workingRows)) {
+            $allMetricVals = [];
+            foreach ($workingRows as $row) {
+                if (isset($row[$metricIdx])) {
+                    $parsed = self::parseNumber((string)$row[$metricIdx]);
+                    if ($parsed !== null) $allMetricVals[] = (float)$parsed;
+                }
+            }
+            if (!empty($allMetricVals)) {
+                sort($allMetricVals);
+                $kpis['min_value'] = $allMetricVals[0];
+                $kpis['max_value'] = end($allMetricVals);
+                $kpis['median'] = $allMetricVals[(int)(count($allMetricVals) / 2)];
+                $kpis['std_dev'] = count($allMetricVals) > 1 ? round(sqrt(array_sum(array_map(function($x) use ($allMetricVals) {
+                    $mean = array_sum($allMetricVals) / count($allMetricVals);
+                    return pow($x - $mean, 2);
+                }, $allMetricVals)) / count($allMetricVals)), 2) : 0;
+            }
+        }
+
+        // Amostra de dados filtrados para a IA (mais registros para contexto)
         $sampleFiltered = [];
-        foreach (array_slice($workingRows, 0, 20) as $row) {
+        foreach (array_slice($workingRows, 0, 30) as $row) {
             $r = [];
             foreach ($headers as $i => $h) {
                 $r[(string)$h] = isset($row[$i]) ? (string)$row[$i] : '';
@@ -503,21 +567,39 @@ class AnalysisEngine
             $sampleFiltered[] = $r;
         }
 
-        // Top ranking
-        $topRanking = array_slice($results, 0, 10, true);
+        // Top ranking — TODOS os itens para análise completa
+        $topRanking = array_slice($results, 0, 30, true);
 
         $analysisSys = self::governancePrompt() . "\n\n" .
-            "Você é um analista sênior de dados. Gere uma ANÁLISE TEXTUAL PROFUNDA E DETALHADA em HTML.\n" .
-            "Estruture em 4 níveis obrigatórios:\n" .
-            "Nível 1 — Visão Geral: responda DIRETAMENTE à pergunta, com o número/valor principal.\n" .
-            "Nível 2 — Distribuição e Concentração: top categorias, percentuais, concentração.\n" .
-            "Nível 3 — Padrões e Comportamentos: recorrência, outliers, relações.\n" .
-            "Nível 4 — Interpretação Analítica: o que os dados revelam, riscos, oportunidades.\n\n" .
-            "REGRAS:\n" .
-            "- Responda DIRETAMENTE à pergunta no primeiro parágrafo com dados concretos.\n" .
-            "- Use os sample_data_rows e top_ranking para extrair valores reais.\n" .
-            "- Formate em HTML limpo (h3, p, strong, ul/li). Não use markdown.\n" .
-            "- Máximo 600 palavras. Seja denso e preciso.\n" .
+            "Você é um consultor financeiro sênior e analista de dados. Gere uma ANÁLISE TEXTUAL PROFUNDA E DETALHADA em HTML.\n" .
+            "Estruture em 5 níveis obrigatórios:\n\n" .
+            "Nível 1 — Visão Geral e Resposta Direta:\n" .
+            "Responda DIRETAMENTE à pergunta com o valor/número principal em destaque.\n" .
+            "Inclua o total, quantidade de registros e período analisado.\n\n" .
+            "Nível 2 — Distribuição e Concentração:\n" .
+            "Liste TODOS os itens do top_ranking com valores exatos em R$.\n" .
+            "Calcule o percentual de cada item sobre o total.\n" .
+            "Identifique concentração (ex: 'os 3 maiores representam X% do total').\n\n" .
+            "Nível 3 — Padrões, Comportamentos e Anomalias:\n" .
+            "Identifique recorrências (fornecedores/categorias que aparecem múltiplas vezes).\n" .
+            "Destaque outliers (valores muito acima ou abaixo da média).\n" .
+            "Analise sazonalidade se houver dados temporais.\n\n" .
+            "Nível 4 — Benchmark e Comparativo de Mercado:\n" .
+            "Com base no tipo de negócio identificado, compare os gastos/receitas com práticas de mercado.\n" .
+            "Exemplo: 'Empresas do setor de construção civil tipicamente alocam 15-25% do orçamento em materiais'.\n" .
+            "Indique se os valores estão dentro, acima ou abaixo da média do setor.\n" .
+            "Sugira referências de mercado para os principais itens.\n\n" .
+            "Nível 5 — Recomendações Estratégicas:\n" .
+            "Forneça 3-5 recomendações acionáveis baseadas nos dados.\n" .
+            "Identifique oportunidades de economia ou otimização.\n" .
+            "Alerte sobre riscos (concentração em poucos fornecedores, gastos crescentes, etc.).\n\n" .
+            "REGRAS DE FORMATAÇÃO:\n" .
+            "- Use HTML limpo: h3 para títulos de nível, p para parágrafos, strong para destaques, ul/li para listas.\n" .
+            "- Valores monetários sempre em formato R$ X.XXX,XX.\n" .
+            "- Cada nível deve ter seu h3 com o número e título.\n" .
+            "- Seja denso, preciso e use DADOS CONCRETOS dos sample_data_rows e top_ranking.\n" .
+            "- Máximo 900 palavras.\n" .
+            "- NÃO use markdown. Apenas HTML.\n" .
             ($filterActive ? "- DADOS FILTRADOS: " . count($workingRows) . " registros de " . count($rows) . " originais.\n" : '');
 
         $analysisData = json_encode([

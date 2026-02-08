@@ -61,6 +61,30 @@ class ReportsController
             }
         }
 
+        $datasetProfile = [];
+        if (!empty($report['dataset_profile_json'])) {
+            $decoded = json_decode((string)$report['dataset_profile_json'], true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $datasetProfile = $decoded;
+            }
+        }
+
+        $inferredContext = [];
+        if (!empty($report['inferred_context_json'])) {
+            $decoded = json_decode((string)$report['inferred_context_json'], true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $inferredContext = $decoded;
+            }
+        }
+
+        $analytics = [];
+        if (!empty($report['analytics_json'])) {
+            $decoded = json_decode((string)$report['analytics_json'], true);
+            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
+                $analytics = $decoded;
+            }
+        }
+
         require __DIR__ . '/../views/reports/view.php';
     }
 }

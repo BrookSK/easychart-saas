@@ -22,12 +22,15 @@ class DashboardController
         $error = '';
         $success = '';
         $lastChartResponse = null;
-        // Agora suportamos múltiplos gráficos por requisição
         $chartsData = [];
         $analysisReportText = null;
         $analysisReportId = null;
         $clarificationQuestions = [];
         $decisionLog = null;
+        $analysisResult = null;
+        $dataHeaders = [];
+        $dataRows = [];
+        $dataKpis = [];
 
         // Trata envio do AI Chart Generator
         if ($_SERVER['REQUEST_METHOD'] === 'POST') {
@@ -140,6 +143,14 @@ class DashboardController
                             ];
 
                             $result = AnalysisEngine::run($ing['table'], $prompt, $overrides, $llmConfig);
+                            $analysisResult = $result;
+
+                            // Passar dados completos para a view (headers + rows filtradas)
+                            $dataHeaders = $ing['table']['headers'] ?? [];
+                            $allRows = $ing['table']['rows'] ?? [];
+                            // Limitar rows para a view (máx 500 para performance)
+                            $dataRows = array_slice($allRows, 0, 500);
+                            $dataKpis = $result['analytics']['kpis'] ?? [];
 
                             $decisionLog = $result['decision_log'] ?? null;
 
@@ -240,11 +251,12 @@ class DashboardController
                             $stmt = $pdo->prepare('INSERT INTO charts (user_id, spreadsheet_id, prompt, chart_type, data_json) VALUES (:user_id, :spreadsheet_id, :prompt, :chart_type, :data_json)');
 
                             foreach ($aiPayload['charts'] as $chartConfig) {
+                                $chartType = $chartConfig['chart_type'] ?? $chartConfig['type'] ?? 'bar';
                                 $stmt->execute([
                                     'user_id'        => $user['id'],
                                     'spreadsheet_id' => $spreadsheetId,
                                     'prompt'         => $prompt,
-                                    'chart_type'     => $chartConfig['chart_type'] ?? null,
+                                    'chart_type'     => $chartType,
                                     'data_json'      => json_encode($chartConfig),
                                 ]);
 
@@ -256,10 +268,14 @@ class DashboardController
                                     $values[] = (float)$v;
                                 }
 
-                                if ($labels && $values && count($labels) === count($values)) {
-                                    $rawType = $chartConfig['chart_type'] ?? 'line';
-                                    $renderType = $rawType;
-                                    if (in_array($rawType, ['boxplot', 'gantt'], true)) {
+                                if (!empty($labels) && !empty($values)) {
+                                    // Garantir que labels e values tenham o mesmo tamanho
+                                    $minLen = min(count($labels), count($values));
+                                    $labels = array_slice($labels, 0, $minLen);
+                                    $values = array_slice($values, 0, $minLen);
+
+                                    $renderType = (string)$chartType;
+                                    if (in_array($renderType, ['boxplot', 'gantt'], true)) {
                                         $renderType = 'bar';
                                     }
                                     $chartsData[] = [
