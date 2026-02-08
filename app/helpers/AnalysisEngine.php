@@ -414,6 +414,25 @@ class AnalysisEngine
             }
         }
 
+        if (count($questions) < 2 && $needsAmount && is_string($amountCol) && $amountCol !== '' && empty($requestPlan['finance_mode'])) {
+            $columnProfiles = $profile['column_profiles'] ?? [];
+            if (is_array($columnProfiles) && isset($columnProfiles[$amountCol]) && is_array($columnProfiles[$amountCol])) {
+                $p = $columnProfiles[$amountCol];
+                $negRatio = (float)($p['neg_ratio'] ?? 0.0);
+                $cur = (int)(($p['signals']['currency'] ?? 0));
+                if (($cur > 0 || $negRatio >= 0.05) && $negRatio > 0.0) {
+                    $questions[] = [
+                        'id' => 'finance_mode',
+                        'type' => 'select',
+                        'label' => 'Como interpretar valores NEGATIVOS na coluna de valor?',
+                        'why' => 'Sem essa confirmação, análises financeiras (ganhos/perdas) e distribuições podem ficar conceitualmente erradas.',
+                        'options' => ['cashflow', 'expenses', 'income'],
+                        'default' => null,
+                    ];
+                }
+            }
+        }
+
         $impactRank = [
             'amount' => 3,
             'date' => 2,
@@ -510,6 +529,129 @@ class AnalysisEngine
             'needs_clarification' => !empty($questions),
             'questions' => $questions,
         ];
+    }
+
+    private static function normalizeEntityKey(string $s): string
+    {
+        $s = trim($s);
+        if ($s === '') {
+            return '';
+        }
+        $t = $s;
+        $t = @iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $t);
+        if (!is_string($t) || $t === '') {
+            $t = $s;
+        }
+        $t = mb_strtolower($t);
+        $t = preg_replace('/\b(s\.?a\.?|sa|ltda|me|eireli|lt|inc|corp|co)\b/u', ' ', $t);
+        $t = preg_replace('/[^a-z0-9]+/u', ' ', $t);
+        $t = preg_replace('/\s+/u', ' ', $t);
+        $t = trim($t);
+        return $t;
+    }
+
+    private static function entityLabelFromSamples(array $samples, string $fallback): string
+    {
+        $best = $fallback;
+        $bestLen = 0;
+        foreach ($samples as $s) {
+            $v = trim((string)$s);
+            if ($v === '') {
+                continue;
+            }
+            $len = mb_strlen($v);
+            if ($len > $bestLen) {
+                $best = $v;
+                $bestLen = $len;
+            }
+        }
+        return $best;
+    }
+
+    private static function isFinancialMetric(?string $col, array $profile, array $analytics, array $columnMap): bool
+    {
+        if (!is_string($col) || $col === '') {
+            return false;
+        }
+        $amountCol = $columnMap['amount']['column'] ?? null;
+        if (is_string($amountCol) && $amountCol !== '' && $amountCol === $col) {
+            return true;
+        }
+        if (!empty($analytics['finance']['cashflow'])) {
+            return true;
+        }
+        $columnProfiles = $profile['column_profiles'] ?? [];
+        if (is_array($columnProfiles) && isset($columnProfiles[$col]) && is_array($columnProfiles[$col])) {
+            $p = $columnProfiles[$col];
+            $cur = (int)(($p['signals']['currency'] ?? 0));
+            $neg = (float)($p['neg_ratio'] ?? 0.0);
+            if ($cur > 0) {
+                return true;
+            }
+            if ($neg >= 0.05) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static function histogramQuantiles(array $vals): array
+    {
+        $n = count($vals);
+        if ($n < 2) {
+            return ['bins' => [], 'counts' => []];
+        }
+        sort($vals);
+        $qs = [0.0, 0.1, 0.25, 0.5, 0.75, 0.9, 1.0];
+        $cuts = [];
+        foreach ($qs as $q) {
+            $idx = (int)round($q * ($n - 1));
+            $cuts[] = (float)$vals[max(0, min($n - 1, $idx))];
+        }
+        $uniqueCuts = [];
+        foreach ($cuts as $c) {
+            $k = (string)round($c, 6);
+            $uniqueCuts[$k] = $c;
+        }
+        $cuts = array_values($uniqueCuts);
+        sort($cuts);
+        if (count($cuts) < 2) {
+            return ['bins' => [self::fmt((float)$cuts[0])], 'counts' => [$n]];
+        }
+
+        $counts = array_fill(0, count($cuts) - 1, 0);
+        foreach ($vals as $v) {
+            $vv = (float)$v;
+            $placed = false;
+            for ($i = 0; $i < count($cuts) - 1; $i++) {
+                $a = $cuts[$i];
+                $b = $cuts[$i + 1];
+                if ($i === count($cuts) - 2) {
+                    if ($vv >= $a && $vv <= $b) {
+                        $counts[$i]++;
+                        $placed = true;
+                        break;
+                    }
+                } else {
+                    if ($vv >= $a && $vv < $b) {
+                        $counts[$i]++;
+                        $placed = true;
+                        break;
+                    }
+                }
+            }
+            if (!$placed) {
+                $counts[count($counts) - 1]++;
+            }
+        }
+
+        $bins = [];
+        for ($i = 0; $i < count($cuts) - 1; $i++) {
+            $a = $cuts[$i];
+            $b = $cuts[$i + 1];
+            $bins[] = self::fmt((float)$a) . '–' . self::fmt((float)$b);
+        }
+        return ['bins' => $bins, 'counts' => $counts];
     }
 
     private static function buildDecisionLog(array $headers, array $types, array $profile, array $columnMap, array $requestPlan, array $context, array $clarification, array $consistency): array
@@ -2143,6 +2285,7 @@ class AnalysisEngine
         if (!$disableFinance) {
             // Ganhos x Perdas: tenta usar coluna amount (mapeada) e sinais (+/-)
             $amountCol = $columnMap['amount']['column'] ?? null;
+            $financeMode = (string)($requestPlan['finance_mode'] ?? '');
             if (is_string($amountCol) && $amountCol !== '') {
                 $aIdx = array_search($amountCol, $headers, true);
                 if ($aIdx !== false) {
@@ -2153,6 +2296,16 @@ class AnalysisEngine
                     foreach ($rows as $row) {
                         $v = isset($row[$aIdx]) ? self::parseNumber((string)$row[$aIdx]) : null;
                         if ($v === null) {
+                            continue;
+                        }
+                        if ($financeMode === 'expenses') {
+                            $sumNeg += -abs((float)$v);
+                            $countNeg++;
+                            continue;
+                        }
+                        if ($financeMode === 'income') {
+                            $sumPos += abs((float)$v);
+                            $countPos++;
                             continue;
                         }
                         if ($v >= 0) {
@@ -2184,17 +2337,30 @@ class AnalysisEngine
             if ($entityIdx !== false) {
                 $agg = [];
                 $counts = [];
+                $labelByKey = [];
+                $samplesByKey = [];
                 foreach ($rows as $row) {
                     $k = isset($row[$entityIdx]) ? trim((string)$row[$entityIdx]) : '';
                     if ($k === '') {
                         continue;
                     }
 
+                    $key = self::normalizeEntityKey($k);
+                    if ($key === '') {
+                        $key = $k;
+                    }
+                    if (!isset($samplesByKey[$key])) {
+                        $samplesByKey[$key] = [];
+                    }
+                    if (count($samplesByKey[$key]) < 8) {
+                        $samplesByKey[$key][] = $k;
+                    }
+
                     if ($metricOp === 'count') {
-                        if (!isset($agg[$k])) {
-                            $agg[$k] = 0.0;
+                        if (!isset($agg[$key])) {
+                            $agg[$key] = 0.0;
                         }
-                        $agg[$k] += 1.0;
+                        $agg[$key] += 1.0;
                         continue;
                     }
 
@@ -2205,12 +2371,12 @@ class AnalysisEngine
                     if ($v === null) {
                         continue;
                     }
-                    if (!isset($agg[$k])) {
-                        $agg[$k] = 0.0;
-                        $counts[$k] = 0;
+                    if (!isset($agg[$key])) {
+                        $agg[$key] = 0.0;
+                        $counts[$key] = 0;
                     }
-                    $agg[$k] += (float)$v;
-                    $counts[$k] += 1;
+                    $agg[$key] += (float)$v;
+                    $counts[$key] += 1;
                 }
 
                 if (!empty($agg)) {
@@ -2220,24 +2386,40 @@ class AnalysisEngine
                             $agg[$k] = $c > 0 ? ((float)$sum / $c) : 0.0;
                         }
                     }
+
+                    foreach ($agg as $k => $_) {
+                        if (!isset($labelByKey[$k])) {
+                            $labelByKey[$k] = self::entityLabelFromSamples($samplesByKey[$k] ?? [], (string)$k);
+                        }
+                    }
+
                     $order = (string)($plan['order'] ?? 'desc');
                     if ($order === 'asc') {
                         asort($agg);
                     } else {
                         arsort($agg);
                     }
+
                     $total = array_sum($agg);
-                    $topAgg = array_slice($agg, 0, 50, true);
+                    $topAggRaw = array_slice($agg, 0, 50, true);
+                    $topAgg = [];
+                    foreach ($topAggRaw as $k => $v) {
+                        $lbl = $labelByKey[$k] ?? (string)$k;
+                        $topAgg[$lbl] = $v;
+                    }
                     $shares = [];
                     if ($total > 0) {
-                        foreach ($topAgg as $k => $v) {
-                            $shares[$k] = (float)$v / (float)$total;
+                        foreach ($topAggRaw as $k => $v) {
+                            $lbl = $labelByKey[$k] ?? (string)$k;
+                            $shares[$lbl] = (float)$v / (float)$total;
                         }
                     }
                     $comparisons['entity_metric_sum'] = [
                         'entity' => $entity,
                         'metric' => $metricOp === 'count' ? 'count' : (string)$metricColumn,
                         'op' => $metricOp,
+                        'label_by_key' => $labelByKey,
+                        'top_sum_raw' => $topAggRaw,
                         'top_sum' => $topAgg,
                         'total_sum' => $total,
                         'top_shares' => $shares,
@@ -2421,6 +2603,8 @@ class AnalysisEngine
         $wantDistribution = in_array('distribution', $intents, true) || in_array('auto', $intents, true);
         $wantShare = in_array('share', $intents, true) || in_array('auto', $intents, true);
 
+        $explicitDistribution = in_array('distribution', $intents, true);
+
         $disable = $requestPlan['disable_blocks'] ?? [];
         if (!is_array($disable)) {
             $disable = [];
@@ -2439,6 +2623,16 @@ class AnalysisEngine
             $metricOp = 'sum';
         }
         $metricOpLabel = $metricOp === 'count' ? 'contagem' : ($metricOp === 'avg' ? 'média' : 'soma');
+
+        $profile = $dashboardPlan['dataset_profile'] ?? [];
+        if (!is_array($profile)) {
+            $profile = [];
+        }
+        $metricCol = $context['main_metric'] ?? null;
+        $isFinancial = self::isFinancialMetric(is_string($metricCol) ? $metricCol : null, $profile, $analytics, $columnMap);
+        if ($isFinancial && !$explicitDistribution) {
+            $wantDistribution = false;
+        }
 
         if (!empty($requestPlan['force_conservative'])) {
             // Em modo conservador, evitamos séries temporais/forecast/gantt e distribuições que poluem.
@@ -2512,18 +2706,40 @@ class AnalysisEngine
             if (($stats['count'] ?? 0) <= 0) {
                 continue;
             }
-            if (!empty($stats['histogram']['bins']) && !empty($stats['histogram']['counts'])) {
+
+            $hist = $stats['histogram'] ?? null;
+            if ($isFinancial && $col === $metricCol) {
+                $vals = [];
+                $idx = array_search($col, $headers, true);
+                if ($idx !== false) {
+                    foreach ($rows as $row) {
+                        $v = isset($row[$idx]) ? self::parseNumber((string)$row[$idx]) : null;
+                        if ($v === null) {
+                            continue;
+                        }
+                        $vals[] = (float)$v;
+                    }
+                }
+                if (!empty($vals)) {
+                    $hist = self::histogramQuantiles($vals);
+                }
+            }
+
+            if (is_array($hist) && !empty($hist['bins']) && !empty($hist['counts'])) {
                 $push([
                     'chart_type' => 'bar',
                     'title' => 'Distribuição: ' . $col,
                     'description' => 'Histograma baseado em bins.',
-                    'labels' => $stats['histogram']['bins'],
-                    'values' => $stats['histogram']['counts'],
+                    'labels' => $hist['bins'],
+                    'values' => $hist['counts'],
                 ]);
             }
 
             // Boxplot best-effort (Chart.js padrão não tem boxplot nativo sem plugin)
-            if (isset($stats['min'], $stats['q1'], $stats['median'], $stats['q3'], $stats['max']) && ($stats['count'] ?? 0) >= 5) {
+            if ($explicitDistribution && isset($stats['min'], $stats['q1'], $stats['median'], $stats['q3'], $stats['max']) && ($stats['count'] ?? 0) >= 30) {
+                if ($isFinancial && $col === $metricCol) {
+                    continue;
+                }
                 $iqr = (float)$stats['q3'] - (float)$stats['q1'];
                 if ($iqr <= 0) {
                     continue;
@@ -2628,14 +2844,26 @@ class AnalysisEngine
                 $sIdx = $secondary ? array_search($secondary, $headers, true) : false;
                 $mIdx = array_search($metric, $headers, true);
                 if ($pIdx !== false && $mIdx !== false && $sIdx !== false) {
-                    $topPrimary = array_keys($topAgg);
-                    $maxCats = min(5, count($topPrimary));
+                    $topPrimaryKeys = array_keys((array)($cmp['top_sum_raw'] ?? []));
+                    $maxCats = min(5, count($topPrimaryKeys));
                     for ($ci = 0; $ci < $maxCats; $ci++) {
-                        $cat = $topPrimary[$ci];
+                        $catKey = $topPrimaryKeys[$ci] ?? null;
+                        if (!is_string($catKey) || $catKey === '') {
+                            continue;
+                        }
+                        $labelByKey = $cmp['label_by_key'] ?? [];
+                        $cat = is_array($labelByKey) && !empty($labelByKey[$catKey]) ? (string)$labelByKey[$catKey] : $catKey;
                         $subAgg = [];
                         foreach ($rows as $row) {
                             $pv = isset($row[$pIdx]) ? trim((string)$row[$pIdx]) : '';
-                            if ($pv !== $cat) {
+                            if ($pv === '') {
+                                continue;
+                            }
+                            $pvKey = self::normalizeEntityKey($pv);
+                            if ($pvKey === '') {
+                                $pvKey = $pv;
+                            }
+                            if ($pvKey !== $catKey) {
                                 continue;
                             }
                             $sv = isset($row[$sIdx]) ? trim((string)$row[$sIdx]) : '';
